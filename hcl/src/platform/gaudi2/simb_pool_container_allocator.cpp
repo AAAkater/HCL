@@ -40,7 +40,7 @@ void SimbPoolContainerAllocatorGaudi2::init()
     poolTypes[SIBO_STANDARD_SIMB_SIZE].push_back(REDUCE_POOL);
     poolTypes[SIBO_STANDARD_SIMB_SIZE].push_back(SCALEUP_AND_ALL2ALL_POOL);
 
-    if (GCFG_HCCL_PRIM_COLLECTIVE_MASK.value())
+    if (GCFG_HCCL_PRIM_COLLECTIVE_MASK.value() || GCFG_HCL_TP2_DEDICATED_DIRECT_API.value())
     {
         poolTypes[SIBO_DOUBLE_SIMB_SIZE].push_back(PRIMITIVE_POOL);
     }

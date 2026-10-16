@@ -59,6 +59,12 @@ public:
     virtual hcclResult_t send_recv_call(int myRank, const SendRecvApiEntry& entry);
     virtual hcclResult_t collective_call(HclCollectiveParams& params);
 
+    uint32_t nativeStreamId(void* streamHandle) { return stream_id(streamHandle); }
+    HclCollectiveRoutinesGen2Arch* nativeCollectiveRoutines(uint32_t streamId)
+    {
+        return streamId < collectives_.size() ? collectives_[streamId] : nullptr;
+    }
+
     virtual hcl_device_t operator->() { return device_; }
     virtual              operator hcl_device_t() { return device_; }
 

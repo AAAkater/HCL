@@ -74,7 +74,7 @@ void HcclGraph::setupExecSets()
 
 hcclResult_t HcclGraph::submit()
 {
-    setupExecSets();
+    instantiate();
     uint64_t startVal = m_graphEngine->initGraph(this);
     for (size_t j = 0; j < m_completionSets.size(); j++)
     {
@@ -89,6 +89,16 @@ hcclResult_t HcclGraph::submit()
     }
     m_graphEngine->finalizeGraph(this, startVal);
     return hcclSuccess;
+}
+
+void HcclGraph::instantiate()
+{
+    if (m_instantiated)
+    {
+        return;
+    }
+    setupExecSets();
+    m_instantiated = true;
 }
 
 int HcclGraph::getWaits(bool incRequests)

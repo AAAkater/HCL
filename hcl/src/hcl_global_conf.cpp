@@ -372,6 +372,48 @@ GlobalConfUint64 GCFG_HCCL_PRIM_COLLECTIVE_MASK(
         DfltUint64(DEFAULT_PRIM_COLLECTIVE_MASK) ,
         MakePublic);
 
+GlobalConfBool GCFG_HCL_TP2_REPLICATED_RS_AR(
+        "HCL_TP2_REPLICATED_RS_AR",
+        "Use a replicated-input reduce-scatter for in-place TP2 BF16 all-reduce",
+        false,
+        MakePublic);
+
+GlobalConfBool GCFG_HCL_TP2_DIRECT_NIC_RS_AR(
+        "HCL_TP2_DIRECT_NIC_RS_AR",
+        "Add a replicated TP2 BF16 source into a preinitialized distinct HBM accumulator with the scale-up NIC",
+        false,
+        MakePublic);
+
+GlobalConfBool GCFG_HCL_TP2_DIRECT_NIC_EXCHANGE(
+        "HCL_TP2_DIRECT_NIC_EXCHANGE",
+        "Exchange replicated TP2 BF16 inputs into distinct HBM buffers without NIC reduction",
+        false,
+        MakePublic);
+
+GlobalConfBool GCFG_HCL_TP2_DIRECT_INPLACE_STAGING(
+        "HCL_TP2_DIRECT_INPLACE_STAGING",
+        "Stage the local TP2 input before direct NIC reduction into the original buffer",
+        false,
+        MakePublic);
+
+GlobalConfBool GCFG_HCL_TP2_DEDICATED_DIRECT_API(
+        "HCL_TP2_DEDICATED_DIRECT_API",
+        "Enable the dedicated preinitialized TP2 direct all-reduce API",
+        false,
+        MakePublic);
+
+GlobalConfUint64 GCFG_HCL_TP2_DIRECT_MAX_COUNT(
+        "HCL_TP2_DIRECT_MAX_COUNT",
+        "Maximum element count handled by the TP2 direct primitive; zero disables the limit",
+        DfltUint64(0),
+        MakePublic);
+
+GlobalConfBool GCFG_HCL_TP2_PRUNE_SCALEOUT_STREAMS(
+        "HCL_TP2_PRUNE_SCALEOUT_STREAMS",
+        "Skip idle scale-out scheduler streams for a direct single-box TP2 NIC reduction",
+        false,
+        MakePublic);
+
 GlobalConfBool GCFG_HCL_COLLECTIVE_LOG(
         "HCL_COLLECTIVE_LOG",
         "Collect HCL collective logs from all ranks to coordinator",

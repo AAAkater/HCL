@@ -20,7 +20,8 @@ void HclCollectiveMemHandlerGaudi2::generateBaseAddressOrSubBuffIdx(SliceState& 
                                                                     uint64_t&         baseAddress,
                                                                     uint32_t&         subBuffIndex)
 {
-    if (!sliceState.m_isReductionCollective || currentOp == eHCLAllGather || currentOp == eHCLGather)
+    if (sliceState.m_execution.m_directScaleupNicTransfer || !sliceState.m_isReductionCollective ||
+        currentOp == eHCLAllGather || currentOp == eHCLGather)
     {
         baseAddress =
             m_addressGenerator.generateScaleUpRecvAddress(sliceState, sliceIter, boxNumInfo, currentOp, offset);

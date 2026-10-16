@@ -109,12 +109,20 @@ void HcclPrimBroadcast::updateCounts()
 }
 
 HcclPrimReduceScatter::HcclPrimReduceScatter(ReduceScatterPrimArgs& args)
-: HcclScaleupPrim(args.scaleupArg), m_castUp(args.castUp)
+: HcclScaleupPrim(args.scaleupArg),
+  m_castUp(args.castUp),
+  m_replicateInput(args.replicateInput),
+  m_directNicTransfer(args.directNicTransfer || args.directNicReduction),
+  m_directNicReduction(args.directNicReduction)
 {
 }
 
 HcclPrimReduceScatter::HcclPrimReduceScatter(ReduceScatterPrimArgs&& args)
-: HcclScaleupPrim(args.scaleupArg), m_castUp(args.castUp)
+: HcclScaleupPrim(args.scaleupArg),
+  m_castUp(args.castUp),
+  m_replicateInput(args.replicateInput),
+  m_directNicTransfer(args.directNicTransfer || args.directNicReduction),
+  m_directNicReduction(args.directNicReduction)
 {
 }
 
@@ -125,19 +133,33 @@ hcclResult_t HcclPrimReduceScatter::process(IHcclGraphEngine* engine)
 
 signalEvents_t HcclPrimReduceScatter::getSignalEvents()
 {
+    if (m_directNicTransfer)
+    {
+        return {SignalEvent::SCALEUP_SEND, SignalEvent::SCALEUP_RECV};
+    }
     return {SignalEvent::EDMA_BATCH};
 }
 
 void HcclPrimReduceScatter::init(HcclGraph* graph, int idx)
 {
     HcclScaleupPrim::init(graph, idx);
-    m_scaleupCountPerRank = div(inputCount(), (uint64_t)m_scaleupGroupSize);
+    if (m_replicateInput)
+    {
+        VERIFY(m_scaleupGroupSize == 2, "Replicated reduce-scatter requires TP2");
+        m_scaleupCountPerRank = inputCount();
+    }
+    else
+    {
+        m_scaleupCountPerRank = div(inputCount(), (uint64_t)m_scaleupGroupSize);
+    }
 }
 
 void HcclPrimReduceScatter::updateCounts()
 {
     m_graph->sendSlice().m_rankScaleOutCount = m_scaleupCountPerRank;  // for edma chunk size
     m_graph->sendSlice().m_rankScaleUpCount = m_graph->recvSlice().m_rankScaleUpCount = m_scaleupCountPerRank;
-    m_graph->sendSlice().m_scaleUpStrideCount = m_graph->recvSlice().m_scaleUpStrideCount = m_scaleupCountPerRank;
-    m_graph->sendSlice().m_boxCount = m_graph->recvSlice().m_boxCount = inputCount();
+    m_graph->sendSlice().m_scaleUpStrideCount = m_graph->recvSlice().m_scaleUpStrideCount =
+        m_replicateInput ? 0 : m_scaleupCountPerRank;
+    m_graph->sendSlice().m_boxCount = m_graph->recvSlice().m_boxCount =
+        m_replicateInput ? inputCount() * m_scaleupGroupSize : inputCount();
 }

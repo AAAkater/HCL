@@ -102,6 +102,9 @@ struct ReduceScatterPrimArgs
 {
     ScaleupPrimArgs scaleupArg;
     bool            castUp = false;
+    bool            replicateInput = false;
+    bool            directNicTransfer = false;
+    bool            directNicReduction = false;
 };
 
 class HcclPrimReduceScatter : public HcclScaleupPrim
@@ -122,8 +125,14 @@ public:
 
     inline uint64_t getCountPerRank() { return m_scaleupCountPerRank; }
     inline bool     castUp() const { return m_castUp; }
+    inline bool     replicateInput() const { return m_replicateInput; }
+    inline bool     directNicTransfer() const { return m_directNicTransfer; }
+    inline bool     directNicReduction() const { return m_directNicReduction; }
 
 private:
     uint64_t m_scaleupCountPerRank = 0;
     bool     m_castUp              = false;
+    bool     m_replicateInput      = false;
+    bool     m_directNicTransfer   = false;
+    bool     m_directNicReduction  = false;
 };

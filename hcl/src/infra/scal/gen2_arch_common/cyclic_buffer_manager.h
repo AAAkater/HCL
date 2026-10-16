@@ -55,6 +55,9 @@ public:
     void        updateCcbHalfFullMechanism();
 
     virtual uint64_t getPi() = 0;
+    uint64_t         getUnwrappedPi() const { return m_pi; }
+    uint64_t         getSubmissionCount() const { return m_submissionCount; }
+    bool             isWritingAlignmentPacket() const { return m_writingAlignmentPacket; }
     void             disableCcb(bool disable) { m_disableCcb = disable; }
     void             dfaLog(hl_logger::LoggerSPtr synDevFailLog);
 
@@ -96,5 +99,7 @@ protected:
     bool           m_disableCcb = false;  // used for null submission
     const uint64_t m_logOfBufferSize;     // Cyclic buffer size
     const uint64_t m_pi_mask;
+    bool           m_writingAlignmentPacket = false;
+    uint64_t       m_submissionCount = 0;
 };
 }  // namespace hcl

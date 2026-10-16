@@ -74,7 +74,9 @@ void CyclicBufferManager::advanceAlignment(size_t size)
     {
         uint64_t alignSize = m_streamInfo.command_alignment - (startAddress & commandAlignmentMask);
 
+        m_writingAlignmentPacket = true;
         m_commands.serializeNopCommand(*m_scalStream, m_schedIdx, alignSize);
+        m_writingAlignmentPacket = false;
         incPi(alignSize);
 
         startAddress = getPi();
@@ -219,6 +221,7 @@ void CyclicBufferManager::submit(bool force)
     {
         incPi(m_sizeSinceAlignment);
         m_scalWrapper.sendStream(m_streamHandle, getPi(), m_streamInfo.submission_alignment);
+        ++m_submissionCount;
     }
 }
 

@@ -74,6 +74,8 @@ struct HclCollectiveParams
     hcclRedOp_t      m_reduceOp        = hcclOpNone;
     HCL_Rank         m_root            = HCL_INVALID_RANK;
     uint64_t         m_remainder_count = 0;
+    bool             m_directScaleupNicTransfer  = false;
+    bool             m_directScaleupNicReduction = false;
 
     HclDynamicCommunicator& m_dynamicComm;
 };

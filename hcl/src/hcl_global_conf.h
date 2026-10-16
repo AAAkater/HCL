@@ -74,6 +74,13 @@ extern GlobalConfBool   GCFG_HCL_USE_NIC_COMPRESSION;
 
 extern GlobalConfBool   GCFG_HCL_NULL_SUBMIT;
 extern GlobalConfUint64 GCFG_HCCL_PRIM_COLLECTIVE_MASK;
+extern GlobalConfBool   GCFG_HCL_TP2_REPLICATED_RS_AR;
+extern GlobalConfBool   GCFG_HCL_TP2_DIRECT_NIC_RS_AR;
+extern GlobalConfBool   GCFG_HCL_TP2_DIRECT_NIC_EXCHANGE;
+extern GlobalConfBool   GCFG_HCL_TP2_DIRECT_INPLACE_STAGING;
+extern GlobalConfBool   GCFG_HCL_TP2_DEDICATED_DIRECT_API;
+extern GlobalConfUint64 GCFG_HCL_TP2_DIRECT_MAX_COUNT;
+extern GlobalConfBool   GCFG_HCL_TP2_PRUNE_SCALEOUT_STREAMS;
 
 extern GlobalConfBool   GCFG_HCL_COLLECTIVE_LOG;
 extern GlobalConfInt64  GCFG_OP_DRIFT_THRESHOLD_MS;

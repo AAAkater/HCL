@@ -100,11 +100,16 @@ endforeach()
 
 add_library(${TARGET_NAME_SO} SHARED ${SRCS})
 
-file(MAKE_DIRECTORY /usr/lib/habanalabs)
+if(DEFINED ENV{HCL_OUTPUT_DIR} AND NOT "$ENV{HCL_OUTPUT_DIR}" STREQUAL "")
+    set(HCL_OUTPUT_DIR "$ENV{HCL_OUTPUT_DIR}")
+else()
+    set(HCL_OUTPUT_DIR "${CMAKE_BINARY_DIR}/lib")
+endif()
+file(MAKE_DIRECTORY "${HCL_OUTPUT_DIR}")
 set_target_properties(${TARGET_NAME_SO} PROPERTIES
     CXX_VISIBILITY_PRESET hidden
-    LIBRARY_OUTPUT_DIRECTORY /usr/lib/habanalabs
-    ARCHIVE_OUTPUT_DIRECTORY /usr/lib/habanalabs
+    LIBRARY_OUTPUT_DIRECTORY "${HCL_OUTPUT_DIR}"
+    ARCHIVE_OUTPUT_DIRECTORY "${HCL_OUTPUT_DIR}"
 )
 
 target_link_libraries(
@@ -112,7 +117,10 @@ target_link_libraries(
     $ENV{HCL_LIB_DIR}/libhl_logger.so
     $ENV{HCL_LIB_DIR}/libhl_gcfg.so
     $ENV{HCL_LIB_DIR}/libhwloc_embedded.a
-    $ENV{HCL_LIB_DIR}/libglpk.a
 )
+
+if(EXISTS "$ENV{HCL_LIB_DIR}/libglpk.a")
+    target_link_libraries(${TARGET_NAME_SO} $ENV{HCL_LIB_DIR}/libglpk.a)
+endif()
 
 separate_debug_symbols(${TARGET_NAME_SO})

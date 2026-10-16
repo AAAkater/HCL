@@ -2,6 +2,7 @@
 
 #include <map>     // for map
 #include <vector>  // for vector
+#include <array>
 
 #include "infra/scal/gen2_arch_common/scal_manager.h"  // for Gen2Arc...
 #include "platform/gen2_arch_common/hcl_graph_sync.h"  // for HclGraphSyncGen2Arch
@@ -9,6 +10,7 @@
 #include "device_simb_pool_manager.h"
 #include "llvm/small_vector.h"  // for SmallVector
 #include "infra/scal/gen2_arch_common/stream_layout.h"
+#include "infra/scal/gen2_arch_common/scal_stream.h"
 
 class HclDeviceGen2Arch;
 class HclCommandsGen2Arch;
@@ -39,6 +41,9 @@ struct ArchStreamSyncParams
     uint64_t m_InternalCgTargetValue          = 0;
     unsigned m_requestedExtraCredits          = 0;
     bool     m_isPrevWaitEvent                = false;
+    bool     m_nativeCaptureActive            = false;
+    uint64_t m_nativeCaptureExternalStart     = 0;
+    uint64_t m_nativeCaptureInternalStart     = 0;
 
     hcl::syncInfo* m_longSo           = nullptr;
     hcl::syncInfo* m_longSoNullSubmit = nullptr;
@@ -60,6 +65,58 @@ class ScalStream;
 class HclDeviceControllerGen2Arch
 {
 public:
+    struct NativeStreamCapture
+    {
+        HclStreamIndex               streamIndex;
+        hcl::NativeHclStreamTemplate commandTemplate;
+        hcl::NativeHclProgram        program;
+    };
+
+    struct NativeGraphCapture
+    {
+        std::vector<NativeStreamCapture> streams;
+        uint64_t externalTargetDelta = 0;
+        uint64_t internalTargetDelta = 0;
+        uint32_t completionLongSoIndex = 0;
+        uint32_t capturedExternalCompletionAddress = 0;
+        uint32_t capturedInternalCompletionAddress = 0;
+        uint32_t capturedGpso0Address = 0;
+        uint32_t capturedGpso1Address = 0;
+        bool executableValidated = false;
+        int tp4Phase = -1; // Explicit RS / AR-AG / standalone AG contract.
+        std::array<uint32_t, 4> capturedEdmaBases = {UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX};
+        std::array<uint32_t, 4> capturedShortMonitorIndexes = {UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX};
+
+        size_t commandCount() const
+        {
+            size_t count = 0;
+            for (const auto& stream : streams) count += stream.commandTemplate.commands.size();
+            return count;
+        }
+
+        size_t relocationCount(hcl::NativeHclRelocationKind kind) const
+        {
+            size_t count = 0;
+            for (const auto& stream : streams)
+            {
+                for (const auto& relocation : stream.commandTemplate.relocations)
+                {
+                    count += relocation.kind == kind;
+                }
+            }
+            return count;
+        }
+
+        bool validate() const;
+    };
+
+    struct NativeReplayCounters
+    {
+        uint64_t bytes = 0;
+        uint64_t ccbWraps = 0;
+        uint64_t submissions = 0;
+    };
+
     HclDeviceControllerGen2Arch(const unsigned numOfStreams);
     virtual ~HclDeviceControllerGen2Arch();
     HclDeviceControllerGen2Arch(const HclDeviceControllerGen2Arch&)            = delete;
@@ -91,6 +148,27 @@ public:
      */
     void setupHFCMonitors(int archStreamId, ArchStreamSyncParams& syncParams);
     void submitWork(int archStreamId, bool submitToHw = true);
+    void               beginNativeCapture(int archStreamId);
+    NativeGraphCapture endNativeCapture(int archStreamId);
+    void               cancelNativeCapture(int archStreamId);
+    hcl::syncInfo replayNativeCapture(int                         archStreamId,
+                                      const NativeGraphCapture&   capture,
+                                      const hcl::NativeHclReplayState& replayState,
+                                      bool                             submit);
+    struct NativeBatchStream
+    {
+        HclStreamIndex streamIndex;
+        hcl::NativeHclProgram program;
+    };
+    using NativeBatchProgram = std::vector<NativeBatchStream>;
+    NativeBatchProgram prepareNativeBatch(int archStreamId,
+        const std::vector<const NativeGraphCapture*>& captures);
+    hcl::NativeHclReplayState prepareNativeReplayState(int archStreamId,
+        const NativeGraphCapture& capture, const hcl::NativeHclReplayState& replayState);
+    void publishNativeBatch(int archStreamId, const NativeBatchProgram& program,
+        const hcl::NativeHclReplayState* states, size_t stateCount);
+    void submitNativeReplay(int archStreamId);
+    NativeReplayCounters nativeReplayCounters(int archStreamId, const NativeGraphCapture& capture);
 
     /**
      * @brief

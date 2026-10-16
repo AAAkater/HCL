@@ -46,6 +46,9 @@ public:
     static std::array<UniqueCollectiveContext, HLS2_BOX_SIZE>
     createUniqueContexts(const RequiredCollectiveContext& context);
 
+    void forceScaleupBufferAddressUpdate(bool enabled) { m_forceScaleupBufferAddressUpdate = enabled; }
+    void invalidateScaleupContextCache();
+
     edwords_t getDwordsForUpdate(bool                             isScaleup,
                                  unsigned                         collectiveContextIndex,
                                  HCL_Comm                         comm,
@@ -123,6 +126,7 @@ private:
     std::vector<g2fw::nic_glbl_ctxt_t>           m_scaleoutGlobalContexts;            // one per EARC
     std::vector<CachedCollectiveContextScaleUp>  m_cachedCollectiveContextsScaleUp;   // one per Collective Context
     std::vector<CachedCollectiveContextScaleOut> m_cachedCollectiveContextsScaleOut;  // one per Collective Context
+    std::vector<bool>                            m_cachedCollectiveContextsScaleUpValid;
 
     std::array<bool, MAX_NICS_GEN2ARCH> m_activeNics;
 
@@ -130,4 +134,5 @@ private:
     int                               m_maxCollectiveContexts = -1;
     HclDeviceGaudi2&                  m_device;
     const Gen2ArchServerConnectivity& m_serverConnectivity;
+    bool                              m_forceScaleupBufferAddressUpdate = false;
 };

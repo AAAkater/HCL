@@ -1,3 +1,4 @@
+#include "infra/scal/gen2_arch_common/cyclic_buffer_manager.h"
 #include "platform/gen2_arch_common/hcl_device_controller.h"
 #include "infra/scal/gen2_arch_common/scal_manager.h"         // for Gen2Arc...
 #include "platform/gen2_arch_common/commands/hcl_commands.h"  // for HclComm...
@@ -5,6 +6,37 @@
 #include "platform/gen2_arch_common/hcl_packets_utils.h"      // for SoBaseAndSize, getCompCfg
 #include "infra/scal/gen2_arch_common/scal_names.h"
 #include "infra/scal/gen2_arch_common/scal_utils.h"
+
+#include <cstdlib>
+#include <cstdio>
+#include <cstring>
+
+bool HclDeviceControllerGen2Arch::NativeGraphCapture::validate() const
+{
+    if (streams.empty() || externalTargetDelta == 0 || capturedExternalCompletionAddress == 0 ||
+        relocationCount(hcl::NativeHclRelocationKind::EXTERNAL_COMPLETION_ADDRESS) == 0)
+    {
+        return false;
+    }
+    if (internalTargetDelta != 0 &&
+        (capturedInternalCompletionAddress == 0 ||
+         relocationCount(hcl::NativeHclRelocationKind::INTERNAL_COMPLETION_ADDRESS) == 0))
+    {
+        return false;
+    }
+    for (const NativeStreamCapture& stream : streams)
+    {
+        if (stream.commandTemplate.empty())
+        {
+            return false;
+        }
+        if (!hcl::validateNativeHclStreamTemplate(stream.commandTemplate))
+        {
+            return false;
+        }
+    }
+    return true;
+}
 
 HclDeviceControllerGen2Arch::HclDeviceControllerGen2Arch(const unsigned numOfStreams) : m_numOfStreams(numOfStreams)
 {
@@ -365,6 +397,378 @@ void HclDeviceControllerGen2Arch::submitWork(int archStreamId, bool submitToHw)
     }
 
     syncParams.m_signalFinalize();
+}
+
+void HclDeviceControllerGen2Arch::beginNativeCapture(int archStreamId)
+{
+    auto& syncParams = getSyncParams(archStreamId);
+    VERIFY(!syncParams.m_nativeCaptureActive, "Native HCL graph capture is already active");
+    VERIFY(syncParams.m_longSo != nullptr, "Native HCL graph requires an initialized completion group");
+    syncParams.m_nativeCaptureActive        = true;
+    syncParams.m_nativeCaptureExternalStart = syncParams.m_longSo->targetValue;
+    syncParams.m_nativeCaptureInternalStart = syncParams.m_InternalCgTargetValue;
+    for (unsigned streamIndex = 0; streamIndex < m_streamLayout->getTotalMicroArchStreamCount(); ++streamIndex)
+    {
+        getScalStream(archStreamId, static_cast<HclStreamIndex>(streamIndex)).beginNativeCapture();
+    }
+}
+
+HclDeviceControllerGen2Arch::NativeGraphCapture HclDeviceControllerGen2Arch::endNativeCapture(int archStreamId)
+{
+    auto& syncParams = getSyncParams(archStreamId);
+    VERIFY(syncParams.m_nativeCaptureActive, "Native HCL graph capture is not active");
+    NativeGraphCapture capture;
+    for (unsigned streamIndex = 0; streamIndex < m_streamLayout->getTotalMicroArchStreamCount(); ++streamIndex)
+    {
+        hcl::NativeHclStreamTemplate commandTemplate =
+            getScalStream(archStreamId, static_cast<HclStreamIndex>(streamIndex)).endNativeCapture();
+        if (!commandTemplate.empty())
+        {
+            capture.streams.push_back(
+                {.streamIndex = static_cast<HclStreamIndex>(streamIndex),
+                 .commandTemplate = std::move(commandTemplate)});
+        }
+    }
+    capture.externalTargetDelta = syncParams.m_longSo->targetValue - syncParams.m_nativeCaptureExternalStart;
+    capture.internalTargetDelta =
+        syncParams.m_InternalCgTargetValue - syncParams.m_nativeCaptureInternalStart;
+    capture.completionLongSoIndex = syncParams.m_longSo->long_so_index;
+    capture.capturedExternalCompletionAddress =
+        m_graphSync[archStreamId]->getCurrentCgSoAddr(CgType::eExternal);
+    capture.capturedInternalCompletionAddress =
+        m_graphSync[archStreamId]->getCurrentCgSoAddr(CgType::eInternal);
+    capture.capturedGpso0Address =
+        m_graphSync[archStreamId]->getCurrentGpsoAddr(WaitMethod::GPSO_0);
+    capture.capturedGpso1Address =
+        m_graphSync[archStreamId]->getCurrentGpsoAddr(WaitMethod::GPSO_1);
+    size_t externalAddressRelocations = 0;
+    size_t internalAddressRelocations = 0;
+    for (NativeStreamCapture& streamCapture : capture.streams)
+    {
+        for (auto& relocation : streamCapture.commandTemplate.relocations)
+        {
+            if (relocation.kind == hcl::NativeHclRelocationKind::PENDING_COMPLETION_ADDRESS ||
+                relocation.kind == hcl::NativeHclRelocationKind::PENDING_COMPLETION_INDEX ||
+                relocation.kind == hcl::NativeHclRelocationKind::PENDING_SHORT_MONITOR)
+            {
+                const bool indexed = relocation.kind == hcl::NativeHclRelocationKind::PENDING_COMPLETION_INDEX;
+                const bool shortMonitor = relocation.kind == hcl::NativeHclRelocationKind::PENDING_SHORT_MONITOR;
+                const uint32_t addresses[] = {capture.capturedExternalCompletionAddress,
+                    capture.capturedInternalCompletionAddress, capture.capturedGpso0Address, capture.capturedGpso1Address};
+                const hcl::NativeHclRelocationKind addressKinds[] = {
+                    hcl::NativeHclRelocationKind::EXTERNAL_COMPLETION_ADDRESS,
+                    hcl::NativeHclRelocationKind::INTERNAL_COMPLETION_ADDRESS,
+                    hcl::NativeHclRelocationKind::GPSO_0_ADDRESS, hcl::NativeHclRelocationKind::GPSO_1_ADDRESS};
+                const hcl::NativeHclRelocationKind indexKinds[] = {
+                    hcl::NativeHclRelocationKind::EXTERNAL_COMPLETION_INDEX,
+                    hcl::NativeHclRelocationKind::INTERNAL_COMPLETION_INDEX,
+                    hcl::NativeHclRelocationKind::GPSO_0_INDEX, hcl::NativeHclRelocationKind::GPSO_1_INDEX};
+                const hcl::NativeHclRelocationKind monitorKinds[] = {
+                    hcl::NativeHclRelocationKind::EXTERNAL_SHORT_MONITOR,
+                    hcl::NativeHclRelocationKind::INTERNAL_SHORT_MONITOR,
+                    hcl::NativeHclRelocationKind::GPSO_0_SHORT_MONITOR,
+                    hcl::NativeHclRelocationKind::GPSO_1_SHORT_MONITOR};
+                size_t pool = 0;
+                while (pool < 4 && relocation.capturedAddress != addresses[pool]) ++pool;
+                VERIFY(pool < 4, "Untracked native completion or short-monitor address 0x{:x}", relocation.capturedAddress);
+                relocation.kind = shortMonitor ? monitorKinds[pool] : indexed ? indexKinds[pool] : addressKinds[pool];
+                if (indexed) capture.capturedEdmaBases[pool] = getSoIdxBaseIdx(addresses[pool]).baseIdx;
+                if (shortMonitor)
+                {
+                    const auto& command = streamCapture.commandTemplate.commands.at(relocation.commandIndex);
+                    uint32_t encoded = 0;
+                    VERIFY(relocation.byteOffset + sizeof(encoded) <= command.bytes.size(),
+                           "Native short-monitor relocation lies outside its command");
+                    std::memcpy(&encoded, command.bytes.data() + relocation.byteOffset, sizeof(encoded));
+                    const uint32_t index = hcl::nativeHclShortMonitorIndex(encoded);
+                    auto& captured = capture.capturedShortMonitorIndexes[pool];
+                    VERIFY(captured == UINT32_MAX || captured == index, "Native short-monitor pool index changed");
+                    captured = index;
+                }
+                continue;
+            }
+            if (relocation.kind != hcl::NativeHclRelocationKind::EXTERNAL_COMPLETION_ADDRESS ||
+                relocation.mask != 0x07ffffffu)
+                continue;
+            const auto& command = streamCapture.commandTemplate.commands.at(relocation.commandIndex);
+            uint32_t encoded = 0;
+            VERIFY(relocation.byteOffset + sizeof(encoded) <= command.bytes.size(),
+                   "Native NIC SOB relocation lies outside its command");
+            std::memcpy(&encoded, command.bytes.data() + relocation.byteOffset, sizeof(encoded));
+            // RS signals its internal reduction GPSO before the external
+            // completion. Classify the same tracked SOB pools used by LBW
+            // relocations; never reinterpret an unknown NIC destination.
+            const std::pair<uint32_t, hcl::NativeHclRelocationKind> pools[] = {
+                {capture.capturedExternalCompletionAddress, hcl::NativeHclRelocationKind::EXTERNAL_COMPLETION_ADDRESS},
+                {capture.capturedInternalCompletionAddress, hcl::NativeHclRelocationKind::INTERNAL_COMPLETION_ADDRESS},
+                {capture.capturedGpso0Address, hcl::NativeHclRelocationKind::GPSO_0_ADDRESS},
+                {capture.capturedGpso1Address, hcl::NativeHclRelocationKind::GPSO_1_ADDRESS}};
+            bool found = false;
+            for (const auto& pool : pools)
+            {
+                if ((encoded & relocation.mask) != (pool.first & relocation.mask)) continue;
+                VERIFY(!found, "Native NIC SOB matches multiple completion pools");
+                relocation.kind = pool.second;
+                found = true;
+            }
+            VERIFY(found, "Untracked native NIC SOB 0x{:x}: external=0x{:x} internal=0x{:x} gpso0=0x{:x} gpso1=0x{:x}",
+                   encoded, capture.capturedExternalCompletionAddress, capture.capturedInternalCompletionAddress,
+                   capture.capturedGpso0Address, capture.capturedGpso1Address);
+        }
+        externalAddressRelocations += hcl::addNativeHclCapturedWordRelocations(
+            streamCapture.commandTemplate,
+            capture.capturedExternalCompletionAddress,
+            hcl::NativeHclRelocationKind::EXTERNAL_COMPLETION_ADDRESS);
+        if (capture.internalTargetDelta != 0)
+        {
+            internalAddressRelocations += hcl::addNativeHclCapturedWordRelocations(
+                streamCapture.commandTemplate,
+                capture.capturedInternalCompletionAddress,
+                hcl::NativeHclRelocationKind::INTERNAL_COMPLETION_ADDRESS);
+        }
+        hcl::addNativeHclCapturedWordRelocations(
+            streamCapture.commandTemplate,
+            capture.capturedGpso0Address,
+            hcl::NativeHclRelocationKind::GPSO_0_ADDRESS);
+        hcl::addNativeHclCapturedWordRelocations(
+            streamCapture.commandTemplate,
+            capture.capturedGpso1Address,
+            hcl::NativeHclRelocationKind::GPSO_1_ADDRESS);
+        streamCapture.program = hcl::NativeHclProgram::prepare(
+            {{&streamCapture.commandTemplate, 0}},
+            getScalStream(archStreamId, streamCapture.streamIndex).nativeCommandAlignment());
+    }
+    syncParams.m_nativeCaptureActive = false;
+    // Count relocations emitted by the packet serializers too. An AllGather
+    // may signal only a packed NIC/EDMA SOB rather than an extra full LBW word.
+    externalAddressRelocations = capture.relocationCount(hcl::NativeHclRelocationKind::EXTERNAL_COMPLETION_ADDRESS);
+    internalAddressRelocations = capture.relocationCount(hcl::NativeHclRelocationKind::INTERNAL_COMPLETION_ADDRESS);
+    VERIFY(externalAddressRelocations != 0,
+           "Native HCL graph did not capture its external completion SOB address 0x{:x}",
+           capture.capturedExternalCompletionAddress);
+    VERIFY(capture.internalTargetDelta == 0 || internalAddressRelocations != 0,
+           "Native HCL graph did not capture its internal completion SOB address 0x{:x}",
+           capture.capturedInternalCompletionAddress);
+    VERIFY(capture.validate(), "Captured native HCL graph has an invalid command or completion contract");
+    capture.executableValidated = true;
+    return capture;
+}
+
+void HclDeviceControllerGen2Arch::cancelNativeCapture(int archStreamId)
+{
+    for (unsigned streamIndex = 0; streamIndex < m_streamLayout->getTotalMicroArchStreamCount(); ++streamIndex)
+    {
+        getScalStream(archStreamId, static_cast<HclStreamIndex>(streamIndex)).cancelNativeCapture();
+    }
+    getSyncParams(archStreamId).m_nativeCaptureActive = false;
+}
+
+hcl::NativeHclReplayState HclDeviceControllerGen2Arch::prepareNativeReplayState(
+    int                              archStreamId,
+    const NativeGraphCapture&        capture,
+    const hcl::NativeHclReplayState& replayState)
+{
+    VERIFY(capture.executableValidated, "Cannot replay a native HCL graph before instantiation");
+    auto& syncParams = getSyncParams(archStreamId);
+    VERIFY(!syncParams.m_nativeCaptureActive, "Cannot replay native HCL commands during capture");
+    VERIFY(syncParams.m_longSo != nullptr, "Native HCL graph requires an initialized completion group");
+    VERIFY(syncParams.m_longSo->long_so_index == capture.completionLongSoIndex,
+           "Native HCL graph completion group changed from {} to {}",
+           capture.completionLongSoIndex,
+           syncParams.m_longSo->long_so_index);
+
+    const uint64_t nextExternalTarget = syncParams.m_longSo->targetValue + capture.externalTargetDelta;
+    const uint64_t nextInternalTarget = syncParams.m_InternalCgTargetValue + capture.internalTargetDelta;
+
+    hcl::NativeHclReplayState patchedState = replayState;
+    patchedState.values[static_cast<size_t>(hcl::NativeHclRelocationKind::EXTERNAL_COMPLETION_TARGET)] =
+        nextExternalTarget;
+    patchedState.values[static_cast<size_t>(hcl::NativeHclRelocationKind::INTERNAL_COMPLETION_TARGET)] =
+        nextInternalTarget;
+    m_graphSync[archStreamId]->incSoIndex(static_cast<unsigned>(capture.externalTargetDelta));
+    patchedState.values[static_cast<size_t>(hcl::NativeHclRelocationKind::EXTERNAL_COMPLETION_ADDRESS)] =
+        m_graphSync[archStreamId]->getCurrentCgSoAddr(CgType::eExternal);
+    patchedState.values[static_cast<size_t>(hcl::NativeHclRelocationKind::INTERNAL_COMPLETION_ADDRESS)] =
+        m_graphSync[archStreamId]->getCurrentCgSoAddr(CgType::eInternal);
+    patchedState.values[static_cast<size_t>(hcl::NativeHclRelocationKind::GPSO_0_ADDRESS)] =
+        m_graphSync[archStreamId]->getCurrentGpsoAddr(WaitMethod::GPSO_0);
+    patchedState.values[static_cast<size_t>(hcl::NativeHclRelocationKind::GPSO_1_ADDRESS)] =
+        m_graphSync[archStreamId]->getCurrentGpsoAddr(WaitMethod::GPSO_1);
+    const hcl::NativeHclRelocationKind addressKinds[] = {
+        hcl::NativeHclRelocationKind::EXTERNAL_COMPLETION_ADDRESS,
+        hcl::NativeHclRelocationKind::INTERNAL_COMPLETION_ADDRESS,
+        hcl::NativeHclRelocationKind::GPSO_0_ADDRESS, hcl::NativeHclRelocationKind::GPSO_1_ADDRESS};
+    const hcl::NativeHclRelocationKind indexKinds[] = {
+        hcl::NativeHclRelocationKind::EXTERNAL_COMPLETION_INDEX,
+        hcl::NativeHclRelocationKind::INTERNAL_COMPLETION_INDEX,
+        hcl::NativeHclRelocationKind::GPSO_0_INDEX, hcl::NativeHclRelocationKind::GPSO_1_INDEX};
+    const hcl::NativeHclRelocationKind monitorKinds[] = {
+        hcl::NativeHclRelocationKind::EXTERNAL_SHORT_MONITOR,
+        hcl::NativeHclRelocationKind::INTERNAL_SHORT_MONITOR,
+        hcl::NativeHclRelocationKind::GPSO_0_SHORT_MONITOR,
+        hcl::NativeHclRelocationKind::GPSO_1_SHORT_MONITOR};
+    const uint32_t capturedAddresses[] = {
+        capture.capturedExternalCompletionAddress, capture.capturedInternalCompletionAddress,
+        capture.capturedGpso0Address, capture.capturedGpso1Address};
+    for (size_t pool = 0; pool < 4; ++pool)
+    {
+        if (capture.capturedShortMonitorIndexes[pool] != UINT32_MAX)
+            patchedState.values[static_cast<size_t>(monitorKinds[pool])] = hcl::nativeHclShortMonitorBits(
+                capture.capturedShortMonitorIndexes[pool], capturedAddresses[pool],
+                static_cast<uint32_t>(patchedState.get(addressKinds[pool])));
+        if (capture.capturedEdmaBases[pool] == UINT32_MAX) continue;
+        const auto location = getSoIdxBaseIdx(static_cast<uint32_t>(patchedState.get(addressKinds[pool])));
+        VERIFY(location.baseIdx == capture.capturedEdmaBases[pool] && location.soIdx <= 0x3ff,
+               "Native EDMA completion moved outside its captured base/index range");
+        patchedState.values[static_cast<size_t>(indexKinds[pool])] = location.soIdx;
+    }
+
+    const char* diagnostics = std::getenv("HCL_TP2_NATIVE_REPLAY_DIAGNOSTICS");
+    if (diagnostics != nullptr && std::strcmp(diagnostics, "1") == 0)
+    {
+        std::fprintf(stderr,
+                     "NATIVE_HCL_REPLAY dependency=%llu:%llu external_target=%llu->%llu "
+                     "internal_target=%llu->%llu external_address=0x%llx->0x%llx "
+                     "internal_address=0x%llx->0x%llx gpso0=0x%llx->0x%llx gpso1=0x%llx->0x%llx "
+                     "relocations=%zu/%zu/%zu/%zu/%zu\n",
+                     static_cast<unsigned long long>(
+                         replayState.get(hcl::NativeHclRelocationKind::DEPENDENCY_LONG_SO_INDEX)),
+                     static_cast<unsigned long long>(
+                         replayState.get(hcl::NativeHclRelocationKind::DEPENDENCY_TARGET)),
+                     static_cast<unsigned long long>(syncParams.m_longSo->targetValue),
+                     static_cast<unsigned long long>(nextExternalTarget),
+                     static_cast<unsigned long long>(syncParams.m_InternalCgTargetValue),
+                     static_cast<unsigned long long>(nextInternalTarget),
+                     static_cast<unsigned long long>(capture.capturedExternalCompletionAddress),
+                     static_cast<unsigned long long>(
+                         patchedState.get(hcl::NativeHclRelocationKind::EXTERNAL_COMPLETION_ADDRESS)),
+                     static_cast<unsigned long long>(capture.capturedInternalCompletionAddress),
+                     static_cast<unsigned long long>(
+                         patchedState.get(hcl::NativeHclRelocationKind::INTERNAL_COMPLETION_ADDRESS)),
+                     static_cast<unsigned long long>(capture.capturedGpso0Address),
+                     static_cast<unsigned long long>(patchedState.get(hcl::NativeHclRelocationKind::GPSO_0_ADDRESS)),
+                     static_cast<unsigned long long>(capture.capturedGpso1Address),
+                     static_cast<unsigned long long>(patchedState.get(hcl::NativeHclRelocationKind::GPSO_1_ADDRESS)),
+                     capture.relocationCount(hcl::NativeHclRelocationKind::DEPENDENCY_TARGET),
+                     capture.relocationCount(hcl::NativeHclRelocationKind::EXTERNAL_COMPLETION_ADDRESS),
+                     capture.relocationCount(hcl::NativeHclRelocationKind::INTERNAL_COMPLETION_ADDRESS),
+                     capture.relocationCount(hcl::NativeHclRelocationKind::GPSO_0_ADDRESS),
+                     capture.relocationCount(hcl::NativeHclRelocationKind::GPSO_1_ADDRESS));
+        std::fflush(stderr);
+        LOG_INFO(HCL,
+                 "Native HCL replay dependency {}:{} external target {}->{} internal target {}->{} "
+                 "external completion address 0x{:x}->0x{:x} internal completion address 0x{:x}->0x{:x} "
+                 "relocations dependency={} external-address={} internal-address={}",
+                 replayState.get(hcl::NativeHclRelocationKind::DEPENDENCY_LONG_SO_INDEX),
+                 replayState.get(hcl::NativeHclRelocationKind::DEPENDENCY_TARGET),
+                 syncParams.m_longSo->targetValue,
+                 nextExternalTarget,
+                 syncParams.m_InternalCgTargetValue,
+                 nextInternalTarget,
+                 capture.capturedExternalCompletionAddress,
+                 patchedState.get(hcl::NativeHclRelocationKind::EXTERNAL_COMPLETION_ADDRESS),
+                 capture.capturedInternalCompletionAddress,
+                 patchedState.get(hcl::NativeHclRelocationKind::INTERNAL_COMPLETION_ADDRESS),
+                 capture.relocationCount(hcl::NativeHclRelocationKind::DEPENDENCY_TARGET),
+                 capture.relocationCount(hcl::NativeHclRelocationKind::EXTERNAL_COMPLETION_ADDRESS),
+                 capture.relocationCount(hcl::NativeHclRelocationKind::INTERNAL_COMPLETION_ADDRESS));
+    }
+
+    syncParams.m_longSo->targetValue = nextExternalTarget;
+    syncParams.m_InternalCgTargetValue = nextInternalTarget;
+    return patchedState;
+}
+
+hcl::syncInfo HclDeviceControllerGen2Arch::replayNativeCapture(
+    int archStreamId, const NativeGraphCapture& capture,
+    const hcl::NativeHclReplayState& replayState, bool submit)
+{
+    const auto state = prepareNativeReplayState(archStreamId, capture, replayState);
+    for (const auto& streamCapture : capture.streams)
+        getScalStream(archStreamId, streamCapture.streamIndex).replayNativeProgram(streamCapture.program, &state, 1);
+    if (submit) submitNativeReplay(archStreamId);
+    return *getSyncParams(archStreamId).m_longSo;
+}
+
+HclDeviceControllerGen2Arch::NativeBatchProgram HclDeviceControllerGen2Arch::prepareNativeBatch(
+    int archStreamId, const std::vector<const NativeGraphCapture*>& captures)
+{
+    VERIFY(!captures.empty() && captures.size() <= 256, "Invalid native NIC batch size");
+    std::map<HclStreamIndex, std::vector<hcl::NativeHclProgram::Input>> byStream;
+    for (size_t node = 0; node < captures.size(); ++node)
+    {
+        VERIFY(captures[node] && captures[node]->executableValidated, "Native NIC batch input is unprepared");
+        for (const auto& stream : captures[node]->streams)
+            byStream[stream.streamIndex].push_back({&stream.commandTemplate, static_cast<uint32_t>(node)});
+    }
+    NativeBatchProgram result;
+    for (const auto& entry : byStream)
+    {
+        const auto alignment = getScalStream(archStreamId, entry.first).nativeCommandAlignment();
+        // The bounded batch is published in full before compute starts. Every
+        // producer/consumer wait remains in the command bytes; captured host
+        // PI writes are unnecessary here. Single-graph replay keeps them.
+        auto program = hcl::NativeHclProgram::prepare(entry.second, alignment, false);
+        // Keep one batch below half the CCB, including worst alignment padding.
+        // Two divisions cover the existing PI/CI lag workaround. Therefore any
+        // CCB recycle wait while writing this batch belongs to earlier,
+        // already-published work, never to its as-yet-unpublished compute peer.
+        const auto ccb = hcl::ScalStream::getCcbSize();
+        const auto division = ccb / hcl::CyclicBufferManager::m_numberOfDivisions;
+        VERIFY(program.pages().size() + 1 <= (ccb / 2 - 2 * division) / alignment,
+               "Native NIC batch exceeds bounded publication capacity");
+        result.push_back({entry.first, std::move(program)});
+    }
+    return result;
+}
+
+void HclDeviceControllerGen2Arch::publishNativeBatch(int archStreamId,
+    const NativeBatchProgram& program, const hcl::NativeHclReplayState* states, size_t stateCount)
+{
+    for (const auto& stream : program)
+        getScalStream(archStreamId, stream.streamIndex).replayNativeProgram(stream.program, states, stateCount);
+    submitNativeReplay(archStreamId);
+}
+
+void HclDeviceControllerGen2Arch::submitNativeReplay(int archStreamId)
+{
+    auto& syncParams = getSyncParams(archStreamId);
+    VERIFY(syncParams.m_longSo != nullptr, "Native HCL graph requires an initialized completion group");
+    for (unsigned streamIndex = 0; streamIndex < m_streamLayout->getTotalMicroArchStreamCount(); ++streamIndex)
+    {
+        hcl::ScalStream& stream = getScalStream(archStreamId, static_cast<HclStreamIndex>(streamIndex));
+        if (stream.requiresSubmission())
+        {
+            stream.submit();
+        }
+    }
+
+    scal_completion_group_set_expected_ctr(m_scalManager->getCgHandle(archStreamId, true),
+                                           syncParams.m_longSo->targetValue);
+    syncParams.m_submittedTargetValue = syncParams.m_longSo->targetValue;
+    if (syncParams.m_InternalCgTargetValue != syncParams.m_submittedInternalCgTargetValue)
+    {
+        scal_completion_group_set_expected_ctr(m_scalManager->getCgHandle(archStreamId, false),
+                                               syncParams.m_InternalCgTargetValue);
+        syncParams.m_submittedInternalCgTargetValue = syncParams.m_InternalCgTargetValue;
+    }
+    syncParams.m_signalFinalize();
+}
+
+HclDeviceControllerGen2Arch::NativeReplayCounters HclDeviceControllerGen2Arch::nativeReplayCounters(
+    int                       archStreamId,
+    const NativeGraphCapture& capture)
+{
+    NativeReplayCounters counters;
+    for (const NativeStreamCapture& streamCapture : capture.streams)
+    {
+        const hcl::ScalStream& stream = getScalStream(archStreamId, streamCapture.streamIndex);
+        const uint64_t         pi     = stream.getUnwrappedPi();
+        counters.bytes += pi;
+        counters.ccbWraps += pi / hcl::ScalStream::getCcbSize();
+        counters.submissions += stream.getSubmissionCount();
+    }
+    return counters;
 }
 
 void HclDeviceControllerGen2Arch::streamAddWait(hcl::ScalStream&            scalStream,

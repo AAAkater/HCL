@@ -14,6 +14,7 @@
 #include "hcl_log_manager.h"                                  // for LOG_*
 #include "platform/gen2_arch_common/commands/hcl_commands.h"  // for HclComm...
 #include "platform/gen2_arch_common/hcl_device.h"             // for HclDevi...
+#include "platform/gaudi2/hcl_device.h"
 #include "platform/gen2_arch_common/collective_states.h"
 #include "hcl_utils.h"  // for VERIFY
 #include "platform/gen2_arch_common/device_simb_pool_manager.h"
@@ -68,6 +69,99 @@ HclCollectiveRoutinesGen2Arch::~HclCollectiveRoutinesGen2Arch()
     {
         delete m_signalsManager;
     }
+}
+
+void HclCollectiveRoutinesGen2Arch::setNativeScaleupBufferAddressRefresh(bool enabled)
+{
+    auto* gaudi2 = dynamic_cast<HclDeviceGaudi2*>(m_device);
+    VERIFY(gaudi2 != nullptr, "Native TP2 buffer-address refresh requires a Gaudi2 device");
+    gaudi2->getContextManager().forceScaleupBufferAddressUpdate(enabled);
+}
+
+void HclCollectiveRoutinesGen2Arch::invalidateNativeScaleupContextCache()
+{
+    auto* gaudi2 = dynamic_cast<HclDeviceGaudi2*>(m_device);
+    VERIFY(gaudi2 != nullptr, "Native TP2 context invalidation requires a Gaudi2 device");
+    gaudi2->getContextManager().invalidateScaleupContextCache();
+}
+
+hcl::syncInfo HclCollectiveRoutinesGen2Arch::replayNativeCapture(
+    const HclDeviceControllerGen2Arch::NativeGraphCapture& capture,
+    HclDynamicCommunicator&                                 dynamicComm,
+    const hcl::syncInfo&                                    dependency,
+    bool                                                    submit)
+{
+    VERIFY(dynamicComm.getScaleupGroupSize() == 2, "Native direct graph requires TP2");
+    VERIFY(!m_nullSubmit, "Native direct graph cannot run with null submission enabled");
+    VERIFY(dependency.targetValue != 0, "Native direct graph requires a compute dependency");
+    VERIFY((dependency.long_so_index >> 3) <= 0xff,
+           "Native direct graph dependency long-SO {} is outside the configured long-monitor quarter",
+           dependency.long_so_index);
+
+    std::lock_guard<std::mutex> streamLock(m_deviceController.getStreamLock(m_streamId));
+    const unsigned peerRankInScaleupGroup = dynamicComm.getRankInScaleupGroup() ^ 1u;
+    m_wqeTracker->incWqe(dynamicComm, peerRankInScaleupGroup, QpType::ScaleUpReduceScatter);
+    const WqeWraparoundBits wraparound =
+        m_wqeTracker->getWqeWraparoundBits(dynamicComm, 0, QpType::ScaleUpReduceScatter);
+
+    hcl::NativeHclReplayState replayState;
+    replayState.values[static_cast<size_t>(hcl::NativeHclRelocationKind::DEPENDENCY_TARGET)] =
+        dependency.targetValue;
+    replayState.values[static_cast<size_t>(hcl::NativeHclRelocationKind::DEPENDENCY_LONG_SO_INDEX)] =
+        dependency.long_so_index;
+    replayState.values[static_cast<size_t>(hcl::NativeHclRelocationKind::WQE_NOTIFY)] =
+        wraparound.notify_rndv_ack;
+    replayState.values[static_cast<size_t>(hcl::NativeHclRelocationKind::WQE_WAIT)] =
+        wraparound.wait_for_rndv_acks;
+
+    hcl::syncInfo completion =
+        m_deviceController.replayNativeCapture(m_streamId, capture, replayState, submit);
+    if (submit) invalidateNativeScaleupContextCache();
+    dynamicComm.updateFaultToleranceCollectivesCounters(static_cast<HCL_StreamId>(m_streamId),
+                                                        completion.targetValue);
+    dynamicComm.m_streamLatestLongSo[m_streamId] = completion.targetValue;
+    return completion;
+}
+
+void HclCollectiveRoutinesGen2Arch::replayNativeBatch(
+    const HclDeviceControllerGen2Arch::NativeBatchProgram& program,
+    const std::vector<const HclDeviceControllerGen2Arch::NativeGraphCapture*>& captures,
+    HclDynamicCommunicator& dynamicComm, const hcl::syncInfo* dependencies,
+    hcl::NativeHclReplayState* states, hcl::syncInfo* completions)
+{
+    const unsigned ranks = dynamicComm.getScaleupGroupSize();
+    VERIFY(!m_nullSubmit && (ranks == 2 || ranks == 4), "Invalid native scale-up batch runtime");
+    for (const auto* capture : captures)
+        VERIFY(ranks == 4 ? capture->tp4Phase >= 0 && capture->tp4Phase <= 2 : capture->tp4Phase == -1,
+               "Native phase contract does not match communicator size");
+    // Match ordinary collective accounting: one receive WQE from every
+    // remote scale-up rank, on the actual RS or AG queue of this phase.
+    // Batch owner holds the stream lock across phase selection/publication.
+    for (size_t node = 0; node < captures.size(); ++node)
+    {
+        const auto qp = captures[node]->tp4Phase > 0 ? QpType::ScaleUpAllGather : QpType::ScaleUpReduceScatter;
+        for (unsigned peer = 0; peer < ranks; ++peer)
+            if (peer != dynamicComm.getRankInScaleupGroup()) m_wqeTracker->incWqe(dynamicComm, peer, qp);
+        const auto bits = m_wqeTracker->getWqeWraparoundBits(dynamicComm, 0, qp);
+        auto& state = states[node];
+        state.values[static_cast<size_t>(hcl::NativeHclRelocationKind::DEPENDENCY_TARGET)] = dependencies[node].targetValue;
+        state.values[static_cast<size_t>(hcl::NativeHclRelocationKind::DEPENDENCY_LONG_SO_INDEX)] = dependencies[node].long_so_index;
+        state.values[static_cast<size_t>(hcl::NativeHclRelocationKind::WQE_NOTIFY)] = bits.notify_rndv_ack;
+        state.values[static_cast<size_t>(hcl::NativeHclRelocationKind::WQE_WAIT)] = bits.wait_for_rndv_acks;
+        state = m_deviceController.prepareNativeReplayState(m_streamId, *captures[node], state);
+        completions[node] = m_longSo;
+        dynamicComm.updateFaultToleranceCollectivesCounters(static_cast<HCL_StreamId>(m_streamId), m_longSo.targetValue);
+        dynamicComm.m_streamLatestLongSo[m_streamId] = m_longSo.targetValue;
+    }
+    m_deviceController.publishNativeBatch(m_streamId, program, states, captures.size());
+    invalidateNativeScaleupContextCache();
+}
+
+void HclCollectiveRoutinesGen2Arch::submitNativeReplay()
+{
+    std::lock_guard<std::mutex> streamLock(m_deviceController.getStreamLock(m_streamId));
+    m_deviceController.submitNativeReplay(m_streamId);
+    invalidateNativeScaleupContextCache();
 }
 
 /**
@@ -677,8 +771,22 @@ void HclCollectiveRoutinesGen2Arch::finalizeExec(HcclGraph* graph, int exec)
                            requiredCredits,
                            commonState->m_currentOp);
 
-    createScaleOutSendProgs(graph->sendSlice(), requiredCredits);
-    createScaleOutRecvProgs(graph->recvSlice(), requiredCredits);
+    if (!commonState->m_directScaleupNicTransfer || !GCFG_HCL_TP2_PRUNE_SCALEOUT_STREAMS.value())
+    {
+        createScaleOutSendProgs(graph->sendSlice(), requiredCredits);
+        createScaleOutRecvProgs(graph->recvSlice(), requiredCredits);
+    }
+    else
+    {
+        const llvm_vecsmall::SmallVector<unsigned, MAX_STREAM_PER_SCHED> noActiveStreams = {};
+        for (const hcl::SchedulersIndex sched :
+             {hcl::SchedulersIndex::sendScaleOut, hcl::SchedulersIndex::recvScaleOut})
+        {
+            hcl::ScalStream& arbStream = m_deviceController.getScalArbUarchStream(m_streamId, sched);
+            arbStream.setTargetValue(m_longSo.targetValue);
+            m_deviceController.setOpExecutionConditions(arbStream, requiredCredits, noActiveStreams);
+        }
+    }
 
     createGeneralPurposeProgs(requiredCredits);
 
@@ -1005,10 +1113,32 @@ hcclResult_t HclCollectiveRoutinesGen2Arch::processRsPrim(HcclGraph* graph, Hccl
     m_requestStrongOrderIter |= rsPrim->isStrongOrderRequired();
     auto& commonState = *(graph->graphState());
 
-    graph->completionSets()[rsPrim->execSet()].requiredResources.tempBuff |= true;
+    const bool directNicTransfer = rsPrim->directNicTransfer();
+    const bool directNicReduction = rsPrim->directNicReduction();
+    const bool stagedInPlaceDirect = directNicTransfer && rsPrim->sendAddr() == rsPrim->recvAddr();
+    graph->completionSets()[rsPrim->execSet()].requiredResources.tempBuff |=
+        !directNicTransfer || stagedInPlaceDirect;
 
-    m_addressGenerator->addressContainer().setScaleupSendAddr(rsPrim->sendAddr());
-    if (rsPrim->useBuffer())
+    if (stagedInPlaceDirect)
+    {
+        m_addressGenerator->addressContainer().setScaleupMemcpySrcAddr(rsPrim->sendAddr());
+        m_addressGenerator->addressContainer().setScaleupMemcpyDstPool(SCALEUP_AND_ALL2ALL_POOL);
+        m_addressGenerator->addressContainer().setScaleupSendPool(SCALEUP_AND_ALL2ALL_POOL);
+    }
+    else
+    {
+        m_addressGenerator->addressContainer().setScaleupSendAddr(rsPrim->sendAddr());
+    }
+    if (directNicTransfer)
+    {
+        VERIFY(!rsPrim->useBuffer(), "Direct NIC transfer requires an explicit receive address");
+        m_addressGenerator->addressContainer().setScaleupRecvAddr(rsPrim->recvAddr());
+        graph->sendSlice().m_execution.m_directScaleupNicTransfer = true;
+        graph->recvSlice().m_execution.m_directScaleupNicTransfer = true;
+        graph->sendSlice().m_execution.m_directScaleupNicReduction = directNicReduction;
+        graph->recvSlice().m_execution.m_directScaleupNicReduction = directNicReduction;
+    }
+    else if (rsPrim->useBuffer())
     {
         m_addressGenerator->addressContainer().setScaleupMemcpyDstPool(
             DeviceSimbPoolManagerBase::fetchPool(rsPrim->getBuffer()));
@@ -1020,14 +1150,19 @@ hcclResult_t HclCollectiveRoutinesGen2Arch::processRsPrim(HcclGraph* graph, Hccl
 
     graph->sendSlice().m_execution.casts.scaleupSendCastUp = rsPrim->castUp();
 
-    VERIFY(rsPrim->getCountPerRank() * commonState.m_dataTypeSizeInBytes <= m_device->getSIBBufferSize(),
-           "Maximal size to be processed per rank by RS primitive is defined by HCL_IMB_SIZE ({}B), consider slicing",
-           m_device->getSIBBufferSize());
+    if (!directNicTransfer)
+    {
+        VERIFY(rsPrim->getCountPerRank() * commonState.m_dataTypeSizeInBytes <= m_device->getSIBBufferSize(),
+               "Maximal size to be processed per rank by RS primitive is defined by HCL_IMB_SIZE ({}B), consider slicing",
+               m_device->getSIBBufferSize());
 
-    m_addressGenerator->addressContainer().setScaleupRecvPool(SCALEUP_AND_ALL2ALL_POOL);
-    uint64_t offset = commonState.m_dynamicComm.getRankInScaleupGroup() * rsPrim->getCountPerRank() *
-                      commonState.m_dataTypeSizeInBytes;
-    m_addressGenerator->addressContainer().setScaleupMemcpySrcAddr(rsPrim->sendAddr() + offset);
+        m_addressGenerator->addressContainer().setScaleupRecvPool(SCALEUP_AND_ALL2ALL_POOL);
+        uint64_t offset = rsPrim->replicateInput()
+                              ? 0
+                              : commonState.m_dynamicComm.getRankInScaleupGroup() * rsPrim->getCountPerRank() *
+                                    commonState.m_dataTypeSizeInBytes;
+        m_addressGenerator->addressContainer().setScaleupMemcpySrcAddr(rsPrim->sendAddr() + offset);
+    }
 
     LOG_HCL_CONTEXT_INFO(HCL, "processing RS primitive, inputCount={}", rsPrim->inputCount());
 
@@ -1039,14 +1174,28 @@ hcclResult_t HclCollectiveRoutinesGen2Arch::processRsPrim(HcclGraph* graph, Hccl
     }
 
     WaitMethod waitMethod = rsPrim->getWaitResource(true);
-    m_signalsManager->enqueueWait(WaitEvent::DMA_WAIT_FOR_SU_RECV,
-                                  {SignalEvent::SCALEUP_RECV},
-                                  waitMethod,
-                                  m_signalsManager->getNextPhase(waitMethod));
+    if (stagedInPlaceDirect)
+    {
+        m_signalsManager->enqueueWait(WaitEvent::GRAPH_SCALEUP_WAIT_EVENT,
+                                      {SignalEvent::EDMA_MEMCOPY},
+                                      waitMethod,
+                                      m_signalsManager->getNextPhase(waitMethod),
+                                      2);
+    }
+    else if (!directNicTransfer)
+    {
+        m_signalsManager->enqueueWait(WaitEvent::DMA_WAIT_FOR_SU_RECV,
+                                      {SignalEvent::SCALEUP_RECV},
+                                      waitMethod,
+                                      m_signalsManager->getNextPhase(waitMethod));
+    }
 
     enqueueWaitsForPrim(rsPrim, waitMethod, std::move(signalEvents));
 
-    m_signalsManager->enqueueCompletion({SignalEvent::SCALEUP_SEND});
+    if (!directNicTransfer)
+    {
+        m_signalsManager->enqueueCompletion({SignalEvent::SCALEUP_SEND});
+    }
 
     rsPrim->updateCounts();
 

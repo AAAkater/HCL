@@ -4,6 +4,46 @@
 #include "collective_interface/hccl_graph.h"
 #include "collective_interface/prims/simple_prims.h"
 #include "collective_interface/prims/scaleup_prims.h"
+#include "hcl_global_conf.h"
+#include "hccl/tp2_direct_api_context.h"
+
+static hcclResult_t ar_runTp2ReplicatedReduceScatter(IHcclGraphEngine* engine,
+                                                     HclCollectiveParams& params,
+                                                     bool directNicTransfer,
+                                                     bool directNicReduction)
+{
+    params.m_currentOp = eHCLReduceScatter;
+    params.m_directScaleupNicTransfer = directNicTransfer;
+    params.m_directScaleupNicReduction = directNicReduction;
+    HcclGraph graph(engine, &params);
+    graph.createPrim<HcclPrimReduceScatter>(ReduceScatterPrimArgs {
+        {params.m_sendBufferAddr, params.m_recvBufferAddr, {}, params.m_count},
+        false,
+        true,
+        directNicTransfer,
+        directNicReduction,
+    });
+    return graph.submit();
+}
+
+std::unique_ptr<HcclGraph> ar_createTp2DirectGraph(IHcclGraphEngine* engine,
+                                                  HclCollectiveParams& params,
+                                                  bool directNicReduction)
+{
+    params.m_currentOp = eHCLReduceScatter;
+    params.m_directScaleupNicTransfer = true;
+    params.m_directScaleupNicReduction = directNicReduction;
+    auto graph = std::make_unique<HcclGraph>(engine, &params);
+    graph->createPrim<HcclPrimReduceScatter>(ReduceScatterPrimArgs {
+        {params.m_sendBufferAddr, params.m_recvBufferAddr, {}, params.m_count},
+        false,
+        true,
+        true,
+        directNicReduction,
+    });
+    graph->instantiate();
+    return graph;
+}
 
 hcclResult_t ar_runPairwise(IHcclGraphEngine* engine, HclCollectiveParams& params)
 {
@@ -14,6 +54,31 @@ hcclResult_t ar_runPairwise(IHcclGraphEngine* engine, HclCollectiveParams& param
     const uint32_t boxesCount       = commSize / scaleupGroupSize;
     const uint64_t countPerRank     = params.m_count / commSize;
     const uint64_t rankAddrOffset   = countPerRank * dataTypeSizeInBytes(params.m_dataType);
+
+    const bool dedicatedDirectRequested = HclGen2::isTp2DedicatedDirectCall();
+    const bool dedicatedExchangeRequested = HclGen2::isTp2DedicatedExchangeCall();
+    const bool directNicExchangeRequested =
+        dedicatedExchangeRequested ||
+        (!dedicatedDirectRequested && GCFG_HCL_TP2_DIRECT_NIC_EXCHANGE.value());
+    const bool directNicRequested =
+        dedicatedDirectRequested || GCFG_HCL_TP2_DIRECT_NIC_RS_AR.value() || directNicExchangeRequested;
+    const bool inPlace = params.m_sendBufferAddr == params.m_recvBufferAddr;
+    const bool useInPlaceStaging = directNicRequested &&
+                                   GCFG_HCL_TP2_DIRECT_INPLACE_STAGING.value() && inPlace;
+    const bool useDirectOutOfPlace = directNicRequested &&
+                                     !GCFG_HCL_TP2_DIRECT_INPLACE_STAGING.value() && !inPlace;
+    const bool useDirectNicExchange = useDirectOutOfPlace && directNicExchangeRequested;
+    const bool useDirectNicReduction = useInPlaceStaging ||
+                                       (useDirectOutOfPlace && !useDirectNicExchange);
+    const bool useDirectNicTransfer = useDirectNicReduction || useDirectNicExchange;
+    const bool validBufferLayout = useDirectNicTransfer || inPlace;
+    if ((GCFG_HCL_TP2_REPLICATED_RS_AR.value() || useDirectNicTransfer) && commSize == 2 &&
+        scaleupGroupSize == 2 && boxesCount == 1 && validBufferLayout && params.m_dataType == hcclBfloat16 &&
+        params.m_reduceOp == hcclSum && params.m_count > 0)
+    {
+        return ar_runTp2ReplicatedReduceScatter(
+            engine, params, useDirectNicTransfer, useDirectNicReduction);
+    }
 
     {
         params.m_currentOp = eHCLReduceScatter;
@@ -105,4 +170,36 @@ hcclResult_t ar_runPairwise(IHcclGraphEngine* engine, HclCollectiveParams& param
         }
         return graph.submit();
     }
+}
+
+// Retain the ordinary four-rank AllReduce arithmetic: ReduceScatter followed
+// by in-place AllGather. Each graph owns one HCL completion, so it can reuse
+// the existing native capture/relocation and completion-ring machinery.
+std::unique_ptr<HcclGraph> ar_createTp4NativePhaseGraph(IHcclGraphEngine* engine,
+                                                      HclCollectiveParams& params, int phase)
+{
+    const auto& comm = params.m_dynamicComm;
+    if (comm.getCommSize() != 4 || comm.getScaleupGroupSize() != 4 || phase < 0 || phase > 2 ||
+        params.m_count == 0 || (phase != 2 && params.m_count % 4 != 0)) return nullptr;
+    params.m_directScaleupNicTransfer = false;
+    params.m_directScaleupNicReduction = false;
+    params.m_currentOp = phase == 0 ? eHCLReduceScatter : eHCLAllGather;
+    params.m_collectiveOp = phase == 2 ? eHCLAllGather : eHCLAllReduce;
+    if (phase == 2) params.m_reduceOp = hcclOpNone;
+    auto graph = std::make_unique<HcclGraph>(engine, &params);
+    if (phase == 0)
+    {
+        const uint64_t perRank = params.m_count / 4;
+        const uint64_t offset = comm.getRankInScaleupGroup() * perRank * dataTypeSizeInBytes(params.m_dataType);
+        graph->createPrim<HcclPrimReduceScatter>(ReduceScatterPrimArgs {
+            {params.m_sendBufferAddr, params.m_recvBufferAddr + offset, {}, params.m_count}, false});
+    }
+    else
+    {
+        graph->startStrongOrder = phase == 1;
+        graph->createPrim<HcclPrimAllGather>(params.m_sendBufferAddr, params.m_recvBufferAddr,
+                                            phase == 1 ? params.m_count / 4 : params.m_count);
+    }
+    graph->instantiate();
+    return graph;
 }

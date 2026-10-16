@@ -72,6 +72,8 @@ public:
      * @return hcclResult_t enum type for submission result
      */
     hcclResult_t submit();
+    void         instantiate();
+    bool         instantiated() const { return m_instantiated; }
 
     /**
      * @brief Create primitive of generic type
@@ -142,4 +144,5 @@ private:
 
     int m_primCtr        = 0;
     int m_requestedWaits = 0;
+    bool m_instantiated  = false;
 };

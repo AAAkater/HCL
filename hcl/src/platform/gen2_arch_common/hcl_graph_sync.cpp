@@ -122,6 +122,11 @@ void HclGraphSyncGen2Arch::createArmMonMessages(hcl::ScalStream& scalStream,
     uint32_t value = createMonArm(soValue, false, mask, soIdxNoMask, 0, useEqual);
 
     m_commands.serializeLbwWriteWithFenceDecCommand(scalStream, scalStream.getSchedIdx(), addr, value, fenceIdx);
+    // The corresponding NIC/EDMA producer rotates its completion SOB on every
+    // replay. Keep this consumer on that same SOB, preserving SOD/SOP/fence.
+    scalStream.addNativeRelocationToLastCommandTail(
+        sizeof(uint32_t), sizeof(uint32_t), 0x0000ffffu, 0, 0,
+        hcl::NativeHclRelocationKind::PENDING_SHORT_MONITOR, getAddrSobObj(smBase, soIdx));
 }
 
 void HclGraphSyncGen2Arch::createArmHFCMonMessages(hcl::ScalStream& scalStream,
@@ -193,16 +198,18 @@ void HclGraphSyncGen2Arch::createArmLongMonMessages(hcl::ScalStream& scalStream,
     const uint32_t monArmSize   = getArmMonSize();
     const uint32_t baseAddrInSm = getOffsetMonArm(monitorIdx);
     LBWBurstData_t destData;
+    llvm_vecsmall::SmallVector<unsigned, LONG_MON_DWORD_SIZE> targetChunks;
 
     for (int i = LONG_MON_DWORD_SIZE - 1; i >= 0; --i)
     {
         uint32_t addr  = smBase + baseAddrInSm + (i * monArmSize);
         uint32_t value = createMonArm(soValue, true, mask, soIdxNoMask, i, useEqual);
 
-        if (i == 0 ||
+        if (scalStream.isNativeCaptureActive() || i == 0 ||
             (m_longMonitorStatus.find(addr) == m_longMonitorStatus.end() || m_longMonitorStatus[addr] != value))
         {
             destData.push_back({addr, value});
+            targetChunks.push_back(static_cast<unsigned>(i));
             if (!m_nullSubmit)
             {
                 m_longMonitorStatus[addr] = value;
@@ -210,6 +217,33 @@ void HclGraphSyncGen2Arch::createArmLongMonMessages(hcl::ScalStream& scalStream,
         }
     }
     m_commands.serializeLbwBurstWriteCommand(scalStream, scalStream.getSchedIdx(), destData);
+    for (size_t entry = 0; entry < targetChunks.size(); ++entry)
+    {
+        // Each LBW entry is the trailing {address, data} pair in the packet.
+        // reg_mon_arm.sod occupies bits 17..31 and carries one 15-bit piece of
+        // the dependency target.  Native capture emits all four pieces so a
+        // replay remains valid when the long-SO target carries into a new
+        // 15-bit word.
+        const uint32_t dataBytesFromEnd =
+            static_cast<uint32_t>((destData.size() - entry) * sizeof(LbwData) - sizeof(uint32_t));
+        scalStream.addNativeRelocationToLastCommandTail(dataBytesFromEnd,
+                                                        sizeof(uint32_t),
+                                                        0xfffe0000u,
+                                                        17,
+                                                        targetChunks[entry] * SO_VAL_BITS,
+                                                        hcl::NativeHclRelocationKind::DEPENDENCY_TARGET);
+        if (targetChunks[entry] == 0)
+        {
+            // reg_mon_arm.sid is bits 0..7 and stores longSoIndex >> 3.
+            scalStream.addNativeRelocationToLastCommandTail(
+                dataBytesFromEnd,
+                sizeof(uint32_t),
+                0x000000ffu,
+                0,
+                3,
+                hcl::NativeHclRelocationKind::DEPENDENCY_LONG_SO_INDEX);
+        }
+    }
     m_commands.serializeFenceDecCommand(scalStream, scalStream.getSchedIdx(), fenceIdx);
 }
 

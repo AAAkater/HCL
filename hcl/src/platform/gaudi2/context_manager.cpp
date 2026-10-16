@@ -244,9 +244,12 @@ void ContextManager::updateCommonDword(unsigned                         collecti
         cachedCollectiveContext = &m_cachedCollectiveContextsScaleOut[collectiveContextIndex];
     }
 
+    const bool forceAll = isScaleup && !m_cachedCollectiveContextsScaleUpValid.at(collectiveContextIndex);
+
     if (dwordsForUpdate.DW0)
     {
-        VERIFY(requiredContext.m_reductionOpcode.raw != cachedCollectiveContext->m_data.reduction_opcode);
+        VERIFY(forceAll || (isScaleup && m_forceScaleupBufferAddressUpdate) ||
+               requiredContext.m_reductionOpcode.raw != cachedCollectiveContext->m_data.reduction_opcode);
 
         updateDWord(contextValues, DW0, requiredContext.m_reductionOpcode.raw);
         cachedCollectiveContext->m_data.reduction_opcode = requiredContext.m_reductionOpcode.raw;
@@ -254,7 +257,8 @@ void ContextManager::updateCommonDword(unsigned                         collecti
 
     if (dwordsForUpdate.DW1)
     {
-        VERIFY(requiredContext.m_syncObjectAddress != cachedCollectiveContext->m_data.sync_object_address_0);
+        VERIFY(forceAll || (isScaleup && m_forceScaleupBufferAddressUpdate) ||
+               requiredContext.m_syncObjectAddress != cachedCollectiveContext->m_data.sync_object_address_0);
 
         updateDWord(contextValues, DW1, requiredContext.m_syncObjectAddress);
         cachedCollectiveContext->m_data.sync_object_address_0 = requiredContext.m_syncObjectAddress;
@@ -262,7 +266,7 @@ void ContextManager::updateCommonDword(unsigned                         collecti
 
     if (dwordsForUpdate.DW2)
     {
-        VERIFY(requiredContext.m_syncObjectAddress != cachedCollectiveContext->m_data.sync_object_address_1);
+        VERIFY(forceAll || requiredContext.m_syncObjectAddress != cachedCollectiveContext->m_data.sync_object_address_1);
 
         updateDWord(contextValues, DW2, requiredContext.m_syncObjectAddress);
         cachedCollectiveContext->m_data.sync_object_address_1 = requiredContext.m_syncObjectAddress;
@@ -270,7 +274,8 @@ void ContextManager::updateCommonDword(unsigned                         collecti
 
     if (dwordsForUpdate.DW3)
     {
-        VERIFY(requiredContext.m_addressMSB != cachedCollectiveContext->m_data.buffer_addr_msb);
+        VERIFY(forceAll || (isScaleup && m_forceScaleupBufferAddressUpdate) ||
+               requiredContext.m_addressMSB != cachedCollectiveContext->m_data.buffer_addr_msb);
 
         updateDWord(contextValues, DW3, requiredContext.m_addressMSB);
         cachedCollectiveContext->m_data.buffer_addr_msb = requiredContext.m_addressMSB;
@@ -278,7 +283,8 @@ void ContextManager::updateCommonDword(unsigned                         collecti
 
     if (dwordsForUpdate.DW4)
     {
-        VERIFY(requiredContext.m_stride != cachedCollectiveContext->m_data.stride);
+        VERIFY(forceAll || (isScaleup && m_forceScaleupBufferAddressUpdate) ||
+               requiredContext.m_stride != cachedCollectiveContext->m_data.stride);
 
         updateDWord(contextValues, DW4, requiredContext.m_stride);
         cachedCollectiveContext->m_data.stride = requiredContext.m_stride;
@@ -477,6 +483,7 @@ void ContextManager::createCollectiveContexts(HclCommandsGen2Arch& commands, con
     {
         m_cachedCollectiveContextsScaleUp.push_back(
             CachedCollectiveContextScaleUp(i, m_nicEngines, m_serverConnectivity, commands));
+        m_cachedCollectiveContextsScaleUpValid.push_back(false);
         m_cachedCollectiveContextsScaleOut.push_back(
             CachedCollectiveContextScaleOut(i, m_nicEngines, m_serverConnectivity, commands));
     }
@@ -602,6 +609,35 @@ edwords_t ContextManager::getDwordsForUpdate(bool                             is
 
     cachedCollectiveContext->dwordDiff(requiredContext, dwordsForUpdate);
 
+    if (isScaleup && !m_cachedCollectiveContextsScaleUpValid.at(collectiveContextIndex))
+    {
+        dwordsForUpdate.DW0 = true;
+        dwordsForUpdate.DW1 = true;
+        dwordsForUpdate.DW2 = true;
+        dwordsForUpdate.DW3 = true;
+        dwordsForUpdate.DW4 = true;
+    }
+
+    // PP send/receive uses the same physical NIC context on another HCL stream.
+    // A native template must restore its datatype, completion SOB, address and
+    // stride. The packet writer registers the encoded SOB's address bits for
+    // relocation; retaining the captured SOB would wait on another epoch.
+    if (isScaleup && m_forceScaleupBufferAddressUpdate)
+    {
+        dwordsForUpdate.DW0 = true;
+        dwordsForUpdate.DW1 = true;
+        dwordsForUpdate.DW3 = true;
+        dwordsForUpdate.DW4 = true;
+        // Standalone AllGather sends from offset zero, whereas the
+        // AllReduce AllGather phase sends its rank-owned receive slice.
+        // Native replay bypasses the host cache: every TP4 template must
+        // restore its own relative-rank descriptor along with its stride.
+        if (m_device.getComm(comm).getCommSize() == 4)
+        {
+            dwordsForUpdate.DW_REMOTE_RANK = true;
+        }
+    }
+
     if (isScaleup)
     {
         CachedCollectiveContextScaleUp* cachedCollectiveContextScaleUp =
@@ -647,6 +683,14 @@ void ContextManager::updateCollectiveContextScaleUp(hcl::ScalStreamBase&        
 {
     edwords_t dwordsForUpdate =
         pDwordsForUpdate ? *pDwordsForUpdate : getDwordsForUpdate(true, collectiveContextIndex, comm, requiredContext);
+    if (!m_cachedCollectiveContextsScaleUpValid.at(collectiveContextIndex))
+    {
+        dwordsForUpdate.DW0 = true;
+        dwordsForUpdate.DW1 = true;
+        dwordsForUpdate.DW2 = true;
+        dwordsForUpdate.DW3 = true;
+        dwordsForUpdate.DW4 = true;
+    }
 
     if (dwordsForUpdate > 0)
     {
@@ -691,6 +735,14 @@ void ContextManager::updateCollectiveContextScaleUp(hcl::ScalStreamBase&        
     m_cachedCollectiveContextsScaleUp[collectiveContextIndex].advanceSOB(dwordsForUpdate,
                                                                          syncObjectAddressIndex,
                                                                          requiredContext.m_syncObjectAddress);
+    m_cachedCollectiveContextsScaleUpValid.at(collectiveContextIndex) = true;
+}
+
+void ContextManager::invalidateScaleupContextCache()
+{
+    std::fill(m_cachedCollectiveContextsScaleUpValid.begin(),
+              m_cachedCollectiveContextsScaleUpValid.end(),
+              false);
 }
 
 void ContextManager::updateCollectiveContextScaleOut(unsigned                         collectiveContextIndex,

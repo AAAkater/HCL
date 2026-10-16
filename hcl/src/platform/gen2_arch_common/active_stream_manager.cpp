@@ -47,8 +47,13 @@ void ActiveStreamManagerGen2Arch::initializeActiveStreams(CommonState& commonSta
         auto& streamList = m_activeStreamsPerScheduler[static_cast<int>(sched)];
         std::fill(streamList.begin(), streamList.end(), nullptr);
 
-        // add the collective stream to the active stream list for each scaleup/scaleout scheduler
-        if (sched != hcl::SchedulersIndex::gp)
+        const bool unusedScaleoutScheduler = GCFG_HCL_TP2_PRUNE_SCALEOUT_STREAMS.value() &&
+                                             m_commonState->m_directScaleupNicTransfer &&
+                                             (sched == hcl::SchedulersIndex::sendScaleOut ||
+                                              sched == hcl::SchedulersIndex::recvScaleOut);
+
+        // A single-box direct-NIC reduction has no scale-out work or credits to arbitrate.
+        if (sched != hcl::SchedulersIndex::gp && !unusedScaleoutScheduler)
         {
             addCollectiveStreamToActiveStreamList((hcl::SchedulersIndex)sched);
         }
@@ -158,6 +163,10 @@ hcl::ScalStream& ActiveStreamManagerGen2Arch::getArbitratorStream(const hcl::Sch
 
 bool ActiveStreamManagerGen2Arch::isReductionStreamActive(bool reductionRS)
 {
+    if (m_commonState->m_directScaleupNicTransfer)
+    {
+        return false;
+    }
     return ((m_commonState->m_16BitReduction || (!m_commonState->m_inPlace && !m_commonState->m_isMultiScaleupGroup)) &&
             reductionRS && m_commonState->m_dynamicComm.getScaleupGroupSize() != 1) ||
            (m_commonState->m_currentOp == eHCLReduceScatter && m_commonState->m_dynamicComm.getScaleupGroupSize() != 1);

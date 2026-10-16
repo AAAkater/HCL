@@ -7,6 +7,7 @@
 #include <cstdint>             // for uint32_t, uint16_t
 #include <memory>              // for __shared_ptr_ac...
 #include <utility>             // for pair, move
+#include <vector>
 
 #include "hcl_utils.h"                                // for VERIFY
 #include "infra/scal/gen2_arch_common/scal_names.h"   // for SchedulersIndex
@@ -28,6 +29,71 @@ static const unsigned edmaOpCodesPerSched[(unsigned)hcl::SchedulersIndex::count]
     INVALID_SCHED,
     INVALID_SCHED,
     g2fw::SCHED_SCALEOUT_RECV_ARC_CMD_NIC_EDMA_OPS};
+
+namespace
+{
+template<typename Setter>
+void registerNativeCompletionField(hcl::ScalStreamBase& scalStream, void* packet, size_t packetSize,
+                                   uint32_t address, uint32_t encoded, bool indexed, Setter&& setter)
+{
+    if (!scalStream.isNativeCaptureActive() || !address) return;
+    const auto kind = indexed ? hcl::NativeHclRelocationKind::PENDING_COMPLETION_INDEX :
+                                hcl::NativeHclRelocationKind::PENDING_COMPLETION_ADDRESS;
+    for (const auto& field : hcl::nativeHclBitfieldSites(packet, packetSize, encoded, setter, kind, address))
+        scalStream.addNativeRelocation(static_cast<const uint8_t*>(packet) + field.byteOffset,
+            field.width, field.mask, field.destinationShift, field.sourceShift, field.kind, field.capturedAddress);
+}
+
+template<typename Packet, typename Setter>
+void registerNativeBooleanRelocation(hcl::ScalStreamBase&    scalStream,
+                                     Packet*                  packet,
+                                     size_t                   packetSize,
+                                     bool                     capturedValue,
+                                     hcl::NativeHclRelocationKind kind,
+                                     Setter&&                 setter)
+{
+    if (!scalStream.isNativeCaptureActive())
+    {
+        return;
+    }
+
+    const uint8_t* bytes = reinterpret_cast<const uint8_t*>(packet);
+    std::vector<uint8_t> original(bytes, bytes + packetSize);
+    setter(!capturedValue);
+
+    size_t  changedByte = packetSize;
+    uint8_t changedMask = 0;
+    unsigned changedBits = 0;
+    for (size_t index = 0; index < packetSize; ++index)
+    {
+        const uint8_t difference = original[index] ^ bytes[index];
+        if (difference != 0)
+        {
+            changedByte = index;
+            changedMask = difference;
+            for (uint8_t bits = difference; bits != 0; bits >>= 1)
+            {
+                changedBits += bits & 1;
+            }
+        }
+    }
+    setter(capturedValue);
+
+    VERIFY(changedBits == 1 && changedByte < packetSize,
+           "Native WQE relocation must describe exactly one packet bit");
+    uint8_t destinationShift = 0;
+    while (((changedMask >> destinationShift) & 1u) == 0u)
+    {
+        ++destinationShift;
+    }
+    scalStream.addNativeRelocation(reinterpret_cast<const uint8_t*>(packet) + changedByte,
+                                   1,
+                                   changedMask,
+                                   destinationShift,
+                                   0,
+                                   kind);
+}
+}  // namespace
 
 void SchedArcCommandsGaudi2::serializeNopCommand(hcl::ScalStreamBase& scalStream, unsigned schedIdx, uint32_t padding)
 {
@@ -385,8 +451,12 @@ void SchedArcCommandsGaudi2::serializeDmaCommand(hcl::ScalStreamBase& scalStream
         SET_FIELD(edma_ops->signal_second, (secondSoAddress != 0));
         SET_FIELD(edma_ops->sob_base, (firstSoIdxBaseIdx.baseIdx & 0x7));
         SET_FIELD(edma_ops->sob_index, (firstSoIdxBaseIdx.soIdx & 0x3ff));
+        registerNativeCompletionField(scalStream, command, sizeInBytes, soAddressLSB, firstSoIdxBaseIdx.soIdx, true,
+            [&](uint32_t value) { edma_ops->sob_index = value; });
         SET_FIELD(edma_ops->second_sob_base, (secondSoIdxBaseIdx.baseIdx & 0x7));
         SET_FIELD(edma_ops->second_sob_index, (secondSoIdxBaseIdx.soIdx & 0x3ff));
+        registerNativeCompletionField(scalStream, command, sizeInBytes, secondSoAddress, secondSoIdxBaseIdx.soIdx, true,
+            [&](uint32_t value) { edma_ops->second_sob_index = value; });
         SET_FIELD(edma_ops->dst_addr_hi, (destAddress >> 32));
         SET_FIELD(edma_ops->src_addr_lo, (srcAddress & 0xffffffff));
         SET_FIELD(edma_ops->src_addr_hi, ((srcAddress >> 32) & 0xffffff));
@@ -454,6 +524,8 @@ void SchedArcCommandsGaudi2::serializeDmaCommand(hcl::ScalStreamBase& scalStream
         auto reductionOpCode = getReductionOp(reduceOp);
         SET_FIELD(edma_ops->reduction_op, reductionOpCode);
         SET_FIELD(edma_ops->sob_address, (soAddressLSB & 0x7ffffff));
+        registerNativeCompletionField(scalStream, command, sizeInBytes, soAddressLSB, soAddressLSB & 0x7ffffff, false,
+            [&](uint32_t value) { edma_ops->sob_address = value; });
         SET_FIELD(edma_ops->opcode, dmaType);
         SET_FIELD(edma_ops->transfer_size, size);
         SET_FIELD(edma_ops->dst_addr_lo, (destAddress & 0xffffffff));
@@ -507,6 +579,8 @@ void SchedArcCommandsGaudi2::serializeDmaCommand(hcl::ScalStreamBase& scalStream
             (struct g2fw::arc_cmd_nic_edma_sibo_memset_v3_t*)&command->sibo_memset_v3;
 
         SET_FIELD(edma_ops->sob_address, (soAddressLSB & 0x7ffffff));
+        registerNativeCompletionField(scalStream, command, sizeInBytes, soAddressLSB, soAddressLSB & 0x7ffffff, false,
+            [&](uint32_t value) { edma_ops->sob_address = value; });
         SET_FIELD(edma_ops->opcode, dmaType);
         SET_FIELD(edma_ops->transfer_size, size);
         SET_FIELD(edma_ops->sibo_index, (indexOfSubBuffer * numberOfSubBuffers));
@@ -551,6 +625,8 @@ void SchedArcCommandsGaudi2::serializeDmaCommand(hcl::ScalStreamBase& scalStream
 
         SET_FIELD(edma_ops->sob_base, (firstSoIdxBaseIdx.baseIdx & 0x7));
         SET_FIELD(edma_ops->sob_index, (firstSoIdxBaseIdx.soIdx & 0x3ff));
+        registerNativeCompletionField(scalStream, command, sizeInBytes, soAddressLSB, firstSoIdxBaseIdx.soIdx, true,
+            [&](uint32_t value) { edma_ops->sob_index = value; });
         SET_FIELD(edma_ops->opcode, dmaType);
         SET_FIELD(edma_ops->transfer_size, size);
         SET_FIELD(edma_ops->dst_addr_lo, (destAddress & 0xffffffff));
@@ -693,6 +769,8 @@ void SchedArcCommandsGaudi2::serializeGlobalDmaCommand(
     SET_FIELD(edma_ops->update_bitmap, activateAllDwordsMap);
     SET_FIELD(edma_ops->num_dwords, numDwords);
     SET_FIELD(edma_ops->sob_address, (soAddressLSB & 0x7ffffff));
+        registerNativeCompletionField(scalStream, command, sizeInBytes, soAddressLSB, soAddressLSB & 0x7ffffff, false,
+            [&](uint32_t value) { edma_ops->sob_address = value; });
 
     struct g2fw::edma_nic_glbl_ctxt_v3_t* edma_ctxt = (struct g2fw::edma_nic_glbl_ctxt_v3_t*)&edma_ops->data;
 
@@ -958,6 +1036,15 @@ void SchedArcCommandsGaudi2::serializeUpdateCollectiveContextCommand(hcl::ScalSt
                 break;
         }
         SET_FIELD(command->dwords[i].dword_value, contextValueUpdater.value);
+        if (scalStream.isNativeCaptureActive() && (dword == DW1 || dword == DW2))
+        {
+            // Native direct TP2 signals the external completion group. NIC
+            // context words encode the SOB in bits 0..26, with control bits
+            // above it. Capture finalization validates this semantic binding.
+            scalStream.addNativeRelocation(&command->dwords[i].dword_value,
+                                           sizeof(uint32_t), 0x07ffffffu, 0, 0,
+                                           hcl::NativeHclRelocationKind::EXTERNAL_COMPLETION_ADDRESS);
+        }
         i++;
     }
 }
@@ -1007,6 +1094,22 @@ void SchedArcCommandsGaudi2::serializeCollectiveSendShortCommand(hcl::ScalStream
     SET_FIELD(cmd_coll_ops_short->nic_opcode, 1);
     SET_FIELD(cmd_coll_ops_short->comm_desc_index, commDescIndex);
     SET_FIELD(cmd_coll_ops_short->buffer_addr_lsb, (address >> 4));
+
+    if (!isSend)
+    {
+        registerNativeBooleanRelocation(scalStream,
+                                        command,
+                                        dwords * sizeof(uint32_t),
+                                        notifyRndvAck,
+                                        hcl::NativeHclRelocationKind::WQE_NOTIFY,
+                                        [&](bool value) { cmd_coll_ops_short->notify_rndv_ack = value; });
+        registerNativeBooleanRelocation(scalStream,
+                                        command,
+                                        dwords * sizeof(uint32_t),
+                                        waitForRndvAcks,
+                                        hcl::NativeHclRelocationKind::WQE_WAIT,
+                                        [&](bool value) { cmd_coll_ops_short->wait_for_rndv_acks = value; });
+    }
 
     if (hasBufferSize)
     {
@@ -1069,6 +1172,19 @@ void SchedArcCommandsGaudi2::serializeCollectiveRecvShortInOrderCommand(hcl::Sca
     SET_FIELD(cmd_coll_ops_short->reduction_opcode, 0);
     SET_FIELD(cmd_coll_ops_short->notify_rndv_ack, notifyRndvAck);
     SET_FIELD(cmd_coll_ops_short->wait_for_rndv_acks, waitForRndvAcks);
+
+    registerNativeBooleanRelocation(scalStream,
+                                    command,
+                                    dwords * sizeof(uint32_t),
+                                    notifyRndvAck,
+                                    hcl::NativeHclRelocationKind::WQE_NOTIFY,
+                                    [&](bool value) { cmd_coll_ops_short->notify_rndv_ack = value; });
+    registerNativeBooleanRelocation(scalStream,
+                                    command,
+                                    dwords * sizeof(uint32_t),
+                                    waitForRndvAcks,
+                                    hcl::NativeHclRelocationKind::WQE_WAIT,
+                                    [&](bool value) { cmd_coll_ops_short->wait_for_rndv_acks = value; });
 
     /**<
      * Reduction parameters to be used when accumulating data into
@@ -1148,6 +1264,22 @@ void SchedArcCommandsGaudi2::serializeCollectiveSendLongCommand(hcl::ScalStreamB
     SET_FIELD(cmd_coll_ops_long->comm_desc_index, commDescIndex);
     SET_FIELD(cmd_coll_ops_long->buffer_addr_lsb, (address & 0xffffffff));  // 32 bits
     SET_FIELD(cmd_coll_ops_long->addr_msb, ((address >> 32) & 0x1fff));     // 13 bits
+
+    if (!isSend)
+    {
+        registerNativeBooleanRelocation(scalStream,
+                                        command,
+                                        dwords * sizeof(uint32_t),
+                                        notifyRndvAck,
+                                        hcl::NativeHclRelocationKind::WQE_NOTIFY,
+                                        [&](bool value) { cmd_coll_ops_long->notify_rndv_ack = value; });
+        registerNativeBooleanRelocation(scalStream,
+                                        command,
+                                        dwords * sizeof(uint32_t),
+                                        waitForRndvAcks,
+                                        hcl::NativeHclRelocationKind::WQE_WAIT,
+                                        [&](bool value) { cmd_coll_ops_long->wait_for_rndv_acks = value; });
+    }
 
     if (hasBufferSize)
     {

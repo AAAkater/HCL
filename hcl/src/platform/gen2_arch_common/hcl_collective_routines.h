@@ -72,6 +72,44 @@ public:
 
     int enqueueWaitsForPrim(HcclPrim* prim, WaitMethod waitMethod, signalEvents_t&& signalEvents);
 
+    void beginNativeCapture() { m_deviceController.beginNativeCapture(m_streamId); }
+    HclDeviceControllerGen2Arch::NativeGraphCapture endNativeCapture()
+    {
+        return m_deviceController.endNativeCapture(m_streamId);
+    }
+    void cancelNativeCapture() { m_deviceController.cancelNativeCapture(m_streamId); }
+    void setNativeScaleupBufferAddressRefresh(bool enabled);
+    void invalidateNativeScaleupContextCache();
+    hcl::syncInfo replayNativeCapture(const HclDeviceControllerGen2Arch::NativeGraphCapture& capture,
+                                      HclDynamicCommunicator&                                 dynamicComm,
+                                      const hcl::syncInfo&                                    dependency,
+                                      bool                                                    submit);
+    void replayNativeBatch(
+        const HclDeviceControllerGen2Arch::NativeBatchProgram& program,
+        const std::vector<const HclDeviceControllerGen2Arch::NativeGraphCapture*>& captures,
+        HclDynamicCommunicator& dynamicComm, const hcl::syncInfo* dependencies,
+        hcl::NativeHclReplayState* states, hcl::syncInfo* completions);
+    void submitNativeReplay();
+    HclDeviceControllerGen2Arch::NativeReplayCounters nativeReplayCounters(
+        const HclDeviceControllerGen2Arch::NativeGraphCapture& capture)
+    {
+        return m_deviceController.nativeReplayCounters(m_streamId, capture);
+    }
+    void nativeWaitOn(const hcl::syncInfo& dependency)
+    {
+        m_deviceController.streamWaitEvent(m_streamId, dependency);
+    }
+    hcl::syncInfo nativeCompletion() const { return m_longSo; }
+    HclDeviceControllerGen2Arch::NativeBatchProgram prepareNativeBatch(
+        const std::vector<const HclDeviceControllerGen2Arch::NativeGraphCapture*>& captures)
+    {
+        return m_deviceController.prepareNativeBatch(m_streamId, captures);
+    }
+    std::mutex& nativeStreamLock() { return m_deviceController.getStreamLock(m_streamId); }
+    unsigned nativeCompletionRingSize() { return m_graphSync.getCgData(true).size; }
+    void nativeSynchronize() { m_deviceController.synchronizeStream(m_streamId); }
+    int  nativeStreamId() const { return m_streamId; }
+
     void           configureExternalSoForCompletion(LBWBurstData_t& completionInfoArr);
     LBWBurstData_t getLbwDataForExternalSoCompletion(unsigned numSignals);
 

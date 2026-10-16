@@ -339,6 +339,12 @@ struct SliceExecutionOutput
     // flag requests reduction execution of data within slice
     bool m_doReduction = false;
 
+    // flag requests a linear HBM receive directly from the scale-up NIC
+    bool m_directScaleupNicTransfer = false;
+
+    // flag requests reduction while performing the direct scale-up NIC transfer
+    bool m_directScaleupNicReduction = false;
+
     // flag requests casts operation of slice data
     castFlag casts;
 };

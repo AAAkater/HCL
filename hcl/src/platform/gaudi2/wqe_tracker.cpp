@@ -4,6 +4,19 @@
 #include "hcl_dynamic_communicator.h"  // for HclDynamicCommunicator
 #include "hcl_utils.h"                 // for VERIFY
 
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+
+namespace
+{
+bool nativeWqeDiagnosticsEnabled()
+{
+    const char* value = std::getenv("HCL_TP2_NATIVE_REPLAY_DIAGNOSTICS");
+    return value != nullptr && std::strcmp(value, "1") == 0;
+}
+}  // namespace
+
 WqeTrackerGaudi2::WqeTrackerGaudi2(unsigned cgSize) : WqeTracker(cgSize)
 {
     VERIFY(m_recvWqeEntriesNum == cgSize >> 1,
@@ -28,7 +41,8 @@ void WqeTrackerGaudi2::incWqe(const HCL_Comm commId, const unsigned rank, const 
     VERIFY(qpTypeIdx < (unsigned)QpType::QPTypeSize);
     VERIFY((int)qpType >= (int)QpType::ScaleOutAllGather || rank < DEFAULT_BOX_SIZE);
 
-    if (((++m_wqePerConnection[qpTypeIdx][commId][rank]) & (m_recvWqeEntriesNum - 1)) == 0)
+    const uint64_t counter = ++m_wqePerConnection[qpTypeIdx][commId][rank];
+    if ((counter & (m_recvWqeEntriesNum - 1)) == 0)
     {
         switch (qpType)
         {
@@ -43,6 +57,21 @@ void WqeTrackerGaudi2::incWqe(const HCL_Comm commId, const unsigned rank, const 
             default:
                 assert(false);
         }
+    }
+    if (nativeWqeDiagnosticsEnabled() && counter >= m_recvWqeEntriesNum - 4 &&
+        counter <= m_recvWqeEntriesNum + 4)
+    {
+        const auto& bits = m_wqeWraparoundBits[qpTypeIdx][commId][0];
+        std::fprintf(stderr,
+                     "NATIVE_WQE inc comm=%u rank=%u qp=%u counter=%llu entries=%u notify=%u wait=%u\n",
+                     static_cast<unsigned>(commId),
+                     rank,
+                     static_cast<unsigned>(qpType),
+                     static_cast<unsigned long long>(counter),
+                     m_recvWqeEntriesNum,
+                     static_cast<unsigned>(bits.notify_rndv_ack),
+                     static_cast<unsigned>(bits.wait_for_rndv_acks));
+        std::fflush(stderr);
     }
 }
 
@@ -101,6 +130,18 @@ WqeWraparoundBits WqeTrackerGaudi2::getWqeWraparoundBits(HCL_Comm commId, unsign
     VERIFY(rank < m_wqePerConnection[qpTypeIdx][commId].size());
 
     auto bitsToReturn = m_wqeWraparoundBits[qpTypeIdx][commId][rank];
+
+    if (nativeWqeDiagnosticsEnabled() && (bitsToReturn.notify_rndv_ack || bitsToReturn.wait_for_rndv_acks))
+    {
+        std::fprintf(stderr,
+                     "NATIVE_WQE get comm=%u rank=%u qp=%u notify=%u wait=%u\n",
+                     static_cast<unsigned>(commId),
+                     rank,
+                     static_cast<unsigned>(qpType),
+                     static_cast<unsigned>(bitsToReturn.notify_rndv_ack),
+                     static_cast<unsigned>(bitsToReturn.wait_for_rndv_acks));
+        std::fflush(stderr);
+    }
 
     auto& ptr              = m_wqeWraparoundBits[qpTypeIdx][commId][rank];
     ptr.wait_for_rndv_acks = ptr.notify_rndv_ack;

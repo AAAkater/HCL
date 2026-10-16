@@ -166,7 +166,8 @@ void HclCollectiveMemHandlerGen2Arch::createMemCopyCommands(SimbPoolContainerAll
                       dstAddr,
                       srcAddr,
                       dataTypeForDma,
-                      sliceState.m_isReductionCollective,
+                      sliceState.m_isReductionCollective &&
+                          !sliceState.m_execution.m_directScaleupNicTransfer,
                       useSibo,
                       numberOfRanks,
                       numberOfSubBuffers,

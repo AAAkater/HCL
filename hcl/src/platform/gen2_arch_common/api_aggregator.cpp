@@ -13,6 +13,7 @@
 #include "hccl_context.h"
 #include "hccl_prim_collectives.h"
 #include "hccl_api_inc.h"                           // for HCCL_CHECK_STOP*
+#include "hccl/tp2_direct_api_context.h"
 #include "hccl_communicator.h"                      // for hccl_communicator
 #include "interfaces/hcl_idevice.h"                 // for IHclDevice
 #include "platform/gen2_arch_common/hccl_device.h"  // for hccl_device()
@@ -20,7 +21,7 @@
 ApiAggregatorGen2Arch::ApiAggregatorGen2Arch(HclCollectiveRoutinesGen2Arch* collectiveRoutines)
 : m_collectiveRoutines(collectiveRoutines)
 {
-    if (GCFG_HCCL_PRIM_COLLECTIVE_MASK.value() != 0)
+    if (GCFG_HCCL_PRIM_COLLECTIVE_MASK.value() != 0 || GCFG_HCL_TP2_DEDICATED_DIRECT_API.value())
     {
         HcclPrimitives::initPrimitiveImpl();
     }
@@ -269,7 +270,15 @@ hcclResult_t ApiAggregatorGen2Arch::addCollectiveApiCall(HclCollectiveParams& pa
 {
     if (m_counter == 0)  // no group mode
     {
-        if (CHECK_PRIM_IMPL(params.m_collectiveOp))
+        const uint64_t tp2DirectMaxCount = GCFG_HCL_TP2_DIRECT_MAX_COUNT.value();
+        const bool dedicatedTp2DirectCall = HclGen2::isTp2DedicatedDirectCall();
+        const bool tp2DirectRequested = dedicatedTp2DirectCall || GCFG_HCL_TP2_DIRECT_NIC_RS_AR.value() ||
+                                        GCFG_HCL_TP2_DIRECT_NIC_EXCHANGE.value();
+        const bool bypassTp2DirectPrimitive =
+            params.m_collectiveOp == eHCLAllReduce &&
+            tp2DirectRequested &&
+            tp2DirectMaxCount > 0 && params.m_count > tp2DirectMaxCount;
+        if ((dedicatedTp2DirectCall || CHECK_PRIM_IMPL(params.m_collectiveOp)) && !bypassTp2DirectPrimitive)
         {
             return HcclPrimitives::run(m_collectiveRoutines, params);
         }

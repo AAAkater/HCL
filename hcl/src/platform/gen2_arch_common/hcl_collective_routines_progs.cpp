@@ -680,6 +680,9 @@ void HclCollectiveRoutinesGen2Arch::createScaleUpSendProgs(SliceState&      send
                                 sendSliceState.m_collectiveOp,
                                 sendSliceState.isRoot()};
 
+        op.m_directNicTransfer = sendSliceState.m_execution.m_directScaleupNicTransfer;
+        op.m_directNicReduction = sendSliceState.m_execution.m_directScaleupNicReduction;
+
         this->createScaleUpCollectiveOp(currentStream, op);
     }
 }
@@ -1358,6 +1361,11 @@ void HclCollectiveRoutinesGen2Arch::createScaleUpRecvProgs(SliceState&      slic
 
     LOG_HCL_CONTEXT_TRACE(HCL, "Serializing scaleup recv scheduler command");
 
+    if (sliceState.m_execution.m_directScaleupNicTransfer)
+    {
+        streamAddSingleWaitIfNeeded(currentStream, {WaitEvent::GRAPH_SCALEUP_WAIT_EVENT});
+    }
+
     if (m_signalsManager->isEventRegistered(SignalEvent::SCALEUP_RECV))
     {
         box_devices_t deviceToRemoteIndex;
@@ -1406,6 +1414,8 @@ void HclCollectiveRoutinesGen2Arch::createScaleUpRecvProgs(SliceState&      slic
 
         syncWithLtuIfNeeded(sliceState, currentStream);
 
+        const bool directNicTransfer = sliceState.m_execution.m_directScaleupNicTransfer;
+        const bool directNicReduction = sliceState.m_execution.m_directScaleupNicReduction;
         ScaleUpCollectiveOp op {
             deviceToRemoteIndex,
             sliceState.m_dynamicComm.m_rankInfo.header.hwModuleID,
@@ -1416,7 +1426,7 @@ void HclCollectiveRoutinesGen2Arch::createScaleUpRecvProgs(SliceState&      slic
             m_signalsManager->dequeueSoAddress(SignalEvent::SCALEUP_RECV),
             false /*receive*/,
             sliceState.isComplexImplementation(),
-            sliceState.m_isReductionCollective,
+            sliceState.m_isReductionCollective && !directNicTransfer,
             sliceState.m_isMultiScaleupGroup && !(sliceState.m_collectiveOp == eHCLReduce &&
                                                   boxNumInfo.m_boxNum == sliceState.m_dynamicComm.getMyScaleupGroup()),
             baseAddress,
@@ -1427,10 +1437,14 @@ void HclCollectiveRoutinesGen2Arch::createScaleUpRecvProgs(SliceState&      slic
             strideCount,
             wraparoundBits.notify_rndv_ack,
             wraparoundBits.wait_for_rndv_acks,
-            sliceState.m_isReductionCollective && (currentOp != eHCLAllGather && currentOp != eHCLGather),
+            sliceState.m_isReductionCollective && !directNicTransfer &&
+                (currentOp != eHCLAllGather && currentOp != eHCLGather),
             subBuffIndex,
             sliceState.m_collectiveOp,
             sliceState.isRoot()};
+
+        op.m_directNicTransfer = directNicTransfer;
+        op.m_directNicReduction = directNicReduction;
 
         this->createScaleUpCollectiveOp(currentStream, op);
     }

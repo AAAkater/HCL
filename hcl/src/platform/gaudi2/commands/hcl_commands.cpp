@@ -302,7 +302,9 @@ void HclCommandsGaudi2::serializeScaleUpCollectiveOp(hcl::ScalStreamBase&   scal
     }
 
     // here we create the collective context which we would like to have in the FW
-    hcclRedOp_t               effectiveReductionOp = hcclOpNone;
+    hcclRedOp_t effectiveReductionOp = scaleupCollectiveOp.m_directNicReduction && scaleupCollectiveOp.m_isSend
+                                           ? scaleupCollectiveOp.m_reduceOp
+                                           : hcclOpNone;
     RequiredCollectiveContext requiredContext(scaleupCollectiveOp.m_collectiveOp,
                                               effectiveReductionOp,
                                               scaleupCollectiveOp.m_soAddress,
@@ -310,6 +312,11 @@ void HclCommandsGaudi2::serializeScaleUpCollectiveOp(hcl::ScalStreamBase&   scal
                                               scaleupCollectiveOp.m_baseAddress >> 32,
                                               scaleupCollectiveOp.m_dataType,
                                               scaleupCollectiveOp.m_strideCount);
+    if (scaleupCollectiveOp.m_directNicReduction && scaleupCollectiveOp.m_isSend &&
+        scaleupCollectiveOp.m_dataType == hcclBfloat16)
+    {
+        requiredContext.m_reductionOpcode.datatype = REDUCTION_BF16;
+    }
 
     std::array<UniqueCollectiveContext, HLS2_BOX_SIZE> uniqueContexts;
     int                                                numberOfEnabledConnections = 0;
@@ -325,7 +332,8 @@ void HclCommandsGaudi2::serializeScaleUpCollectiveOp(hcl::ScalStreamBase&   scal
                                                           scaleupCollectiveOp.m_isSend,
                                                           scaleupCollectiveOp.m_isComplexCollective,
                                                           scaleupCollectiveOp.m_isReductionInIMB,
-                                                          scaleupCollectiveOp.m_isReduction,
+                                                          scaleupCollectiveOp.m_isReduction ||
+                                                              scaleupCollectiveOp.m_directNicTransfer,
                                                           scaleupCollectiveOp.m_isHierarchical,
                                                           scaleupCollectiveOp.m_count,
                                                           scaleupCollectiveOp.m_cellCount,

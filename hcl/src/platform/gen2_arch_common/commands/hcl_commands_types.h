@@ -162,7 +162,9 @@ struct ScaleUpCollectiveOp
     uint64_t                m_strideCount;
     bool                    m_notifyRndvAck;
     bool                    m_waitForRndvAcks;
-    bool                    m_isReduction       = false;
+    bool                    m_isReduction        = false;
+    bool                    m_directNicTransfer  = false;
+    bool                    m_directNicReduction = false;
     uint32_t                m_subBuffIndex      = 0;
     HCL_CollectiveOp        m_complexCollective = eHCLNoCollective;
     bool                    m_isRoot            = false;

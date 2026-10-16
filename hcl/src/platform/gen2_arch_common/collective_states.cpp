@@ -879,6 +879,10 @@ uint64_t CommonState::getChunkCountToClear()
 
 uint64_t CommonState::getStrideCount()
 {
+    if (m_currentOp == eHCLReduceScatter && m_scaleUpStrideCount == 0)
+    {
+        return 0;
+    }
     if (isComplexImplementation())
     {
         return m_rankScaleUpCount;
