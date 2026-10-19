@@ -1511,6 +1511,7 @@ extern "C" hcclResult_t HCCL_API_CALL hcclTp2NativeGraphCreate(
 
 // Capability is an artifact property, not a serving optimization switch.
 extern "C" uint32_t HCCL_API_CALL hcclTp4NativeGraphVersion() { return 1; }
+extern "C" uint32_t HCCL_API_CALL hcclTp8NativeGraphVersion() { return 1; }
 
 extern "C" hcclResult_t HCCL_API_CALL hcclTp4NativeGraphCreate(
     const void* sendbuff, void* recvbuff, size_t count, hcclDataType_t datatype,
@@ -1518,13 +1519,18 @@ extern "C" hcclResult_t HCCL_API_CALL hcclTp4NativeGraphCreate(
     hcclTp2NativeGraphHandle* graphHandle)
 {
     if (!graphHandle || !sendbuff || !recvbuff || !streamHandle || datatype != hcclBfloat16 ||
-        reduceOp != hcclSum || count == 0 || count > 32768 || phase < 0 || phase > 2 ||
-        (phase != 2 && count % 4 != 0) || (phase == 1 ? sendbuff != recvbuff : sendbuff == recvbuff))
+        reduceOp != hcclSum || count == 0 || phase < 0 || phase > 2 ||
+        (phase == 1 ? sendbuff != recvbuff : sendbuff == recvbuff))
         return hcclInvalidArgument;
     *graphHandle = nullptr;
     auto* communicator = hccl_ctx.communicator(comm);
-    if (!communicator || !communicator->getDynamicComm() || communicator->getCommSize() != 4 ||
-        communicator->getDynamicComm()->getScaleupGroupSize() != 4) return hcclInvalidArgument;
+    if (!communicator || !communicator->getDynamicComm() || (communicator->getCommSize() != 4 && communicator->getCommSize() != 8) ||
+        communicator->getDynamicComm()->getScaleupGroupSize() != communicator->getCommSize() ||
+        (phase != 2 && count % communicator->getCommSize() != 0)) return hcclInvalidArgument;
+    // The TP8 export assumes a bounded 64 * 5120-element capacity. Keep the
+    // existing TP4 limit while admitting TP8's wider collectives.
+    const size_t maxCount = communicator->getCommSize() == 8 ? size_t(64) * 5120 : size_t(32768);
+    if (count > maxCount) return hcclInvalidArgument;
     try
     {
         const uint32_t streamId = hccl_device().nativeStreamId(streamHandle);

@@ -632,7 +632,7 @@ edwords_t ContextManager::getDwordsForUpdate(bool                             is
         // AllReduce AllGather phase sends its rank-owned receive slice.
         // Native replay bypasses the host cache: every TP4 template must
         // restore its own relative-rank descriptor along with its stride.
-        if (m_device.getComm(comm).getCommSize() == 4)
+        if (m_device.getComm(comm).getCommSize() == 4 || m_device.getComm(comm).getCommSize() == 8)
         {
             dwordsForUpdate.DW_REMOTE_RANK = true;
         }

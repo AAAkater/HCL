@@ -130,9 +130,9 @@ void HclCollectiveRoutinesGen2Arch::replayNativeBatch(
     hcl::NativeHclReplayState* states, hcl::syncInfo* completions)
 {
     const unsigned ranks = dynamicComm.getScaleupGroupSize();
-    VERIFY(!m_nullSubmit && (ranks == 2 || ranks == 4), "Invalid native scale-up batch runtime");
+    VERIFY(!m_nullSubmit && (ranks == 2 || ranks == 4 || ranks == 8), "Invalid native scale-up batch runtime");
     for (const auto* capture : captures)
-        VERIFY(ranks == 4 ? capture->tp4Phase >= 0 && capture->tp4Phase <= 2 : capture->tp4Phase == -1,
+        VERIFY(ranks > 2 ? capture->tp4Phase >= 0 && capture->tp4Phase <= 2 : capture->tp4Phase == -1,
                "Native phase contract does not match communicator size");
     // Match ordinary collective accounting: one receive WQE from every
     // remote scale-up rank, on the actual RS or AG queue of this phase.

@@ -179,8 +179,9 @@ std::unique_ptr<HcclGraph> ar_createTp4NativePhaseGraph(IHcclGraphEngine* engine
                                                       HclCollectiveParams& params, int phase)
 {
     const auto& comm = params.m_dynamicComm;
-    if (comm.getCommSize() != 4 || comm.getScaleupGroupSize() != 4 || phase < 0 || phase > 2 ||
-        params.m_count == 0 || (phase != 2 && params.m_count % 4 != 0)) return nullptr;
+    const auto ranks = comm.getCommSize();
+    if ((ranks != 4 && ranks != 8) || comm.getScaleupGroupSize() != ranks || phase < 0 || phase > 2 ||
+        params.m_count == 0 || (phase != 2 && params.m_count % ranks != 0)) return nullptr;
     params.m_directScaleupNicTransfer = false;
     params.m_directScaleupNicReduction = false;
     params.m_currentOp = phase == 0 ? eHCLReduceScatter : eHCLAllGather;
@@ -189,7 +190,7 @@ std::unique_ptr<HcclGraph> ar_createTp4NativePhaseGraph(IHcclGraphEngine* engine
     auto graph = std::make_unique<HcclGraph>(engine, &params);
     if (phase == 0)
     {
-        const uint64_t perRank = params.m_count / 4;
+        const uint64_t perRank = params.m_count / ranks;
         const uint64_t offset = comm.getRankInScaleupGroup() * perRank * dataTypeSizeInBytes(params.m_dataType);
         graph->createPrim<HcclPrimReduceScatter>(ReduceScatterPrimArgs {
             {params.m_sendBufferAddr, params.m_recvBufferAddr + offset, {}, params.m_count}, false});
@@ -198,7 +199,7 @@ std::unique_ptr<HcclGraph> ar_createTp4NativePhaseGraph(IHcclGraphEngine* engine
     {
         graph->startStrongOrder = phase == 1;
         graph->createPrim<HcclPrimAllGather>(params.m_sendBufferAddr, params.m_recvBufferAddr,
-                                            phase == 1 ? params.m_count / 4 : params.m_count);
+                                            phase == 1 ? params.m_count / ranks : params.m_count);
     }
     graph->instantiate();
     return graph;
